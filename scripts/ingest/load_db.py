@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 import argparse
 import asyncio
 from pathlib import Path
