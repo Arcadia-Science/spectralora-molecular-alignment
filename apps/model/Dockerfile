@@ -1,4 +1,4 @@
-FROM python:3.8-slim
+FROM python:3.13.1-slim
 
 WORKDIR /app
 
@@ -7,10 +7,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir numpy torch e3nn matplotlib
-RUN pip install --no-cache-dir torch_scatter torch_cluster torch_sparse torch_spline_conv
-RUN pip install --no-cache-dir torch_geometric
-RUN pip install --no-cache-dir -r /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt -f https://data.pyg.org/whl/torch-2.8.0+cpu.html
 
 COPY app /app/app
 

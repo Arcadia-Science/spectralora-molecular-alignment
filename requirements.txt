@@ -95,7 +95,9 @@ pyarrow==22.0.0
 pycparser==2.23
 pydantic==2.12.5
 pydantic_core==2.41.5
-pyg_lib==0.5.0+pt28
+pyg_lib==0.5.0+pt28; platform_system == "Darwin"
+pyg_lib==0.5.0+pt28cpu; platform_system == "Linux" and platform_machine == "x86_64"
+pyg_lib==0.5.0+pt28cpu; platform_system == "Windows" and platform_machine == "AMD64"
 Pygments==2.19.2
 pyparsing==3.3.1
 pytest==9.0.2
@@ -122,10 +124,18 @@ terminado==0.18.1
 tinycss2==1.4.0
 torch==2.8.0
 torch-geometric==2.7.0
-torch_cluster==1.6.3
-torch_scatter==2.1.2
-torch_sparse==0.6.18
-torch_spline_conv==1.2.2
+torch_cluster==1.6.3; platform_system == "Darwin"
+torch_cluster==1.6.3+pt28cpu; platform_system == "Linux"
+torch_cluster==1.6.3+pt28cpu; platform_system == "Windows"
+torch_scatter==2.1.2; platform_system == "Darwin"
+torch_scatter==2.1.2+pt28cpu; platform_system == "Linux"
+torch_scatter==2.1.2+pt28cpu; platform_system == "Windows"
+torch_sparse==0.6.18; platform_system == "Darwin"
+torch_sparse==0.6.18+pt28cpu; platform_system == "Linux"
+torch_sparse==0.6.18+pt28cpu; platform_system == "Windows"
+torch_spline_conv==1.2.2; platform_system == "Darwin"
+torch_spline_conv==1.2.2+pt28cpu; platform_system == "Linux"
+torch_spline_conv==1.2.2+pt28cpu; platform_system == "Windows"
 torchaudio==2.8.0
 torchvision==0.23.0
 tornado==6.5.4

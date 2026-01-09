@@ -38,7 +38,7 @@ class DetaNet(nn.Module):
                  rc:float=5.0,
                  dropout:float=0.0,
                  use_cutoff:bool=False,
-                 max_atomic_number:int=9,
+                 max_atomic_number:int=118,
                  atom_ref:FloatTensor=None,
                  scale:float=1.0,
                  scalar_outsize:int=1,

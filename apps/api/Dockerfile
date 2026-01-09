@@ -1,9 +1,9 @@
-FROM python:3.11-slim
+FROM python:3.13.1-slim
 
 WORKDIR /app
 
 COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt -f https://data.pyg.org/whl/torch-2.8.0+cpu.html
 
 COPY app /app/app
 
