@@ -113,3 +113,10 @@ export INFERENCE_DATASET=ext_val
 - The model service uses Python 3.8 and loads code/weights from `capsule-3259363/code`.
 - Raman endpoint returns `x`, normalized `y`, and a `png_base64` image.
 - NMR aggregation is a separate endpoint; the base NMR endpoint returns raw `sc`/`sh`.
+
+
+### Install
+
+```
+pip install -r requirements.txt -f https://data.pyg.org/whl/torch-2.8.0+cpu.html
+```
