@@ -1,6 +1,23 @@
 import torch
 from .detanet import DetaNet
-def scalar_model(device,params='trained_param/qm7x/energy.pth',max_number=9):
+
+def _pad_tensor(source, target_shape):
+    if source.shape == target_shape:
+        return source
+    result = source.new_zeros(target_shape)
+    slices = tuple(slice(0, min(s, t)) for s, t in zip(source.shape, target_shape))
+    result[slices] = source[slices]
+    return result
+
+def _load_state_dict(model, state_dict):
+    model_state = model.state_dict()
+    for key in ("Embedding.nuclare_emb.weight", "Embedding.elec_emb.weight"):
+        if key in state_dict and key in model_state:
+            if state_dict[key].shape != model_state[key].shape:
+                state_dict[key] = _pad_tensor(state_dict[key], model_state[key].shape)
+    model.load_state_dict(state_dict=state_dict)
+
+def scalar_model(device,params='trained_param/qm7x/energy.pth',max_number=118):
     state_dict = torch.load(params)
     model = DetaNet(num_features=128,
                     act='swish',
@@ -22,7 +39,7 @@ def scalar_model(device,params='trained_param/qm7x/energy.pth',max_number=9):
                     out_type='scalar',
                     grad_type=None,
                     device=device)
-    model.load_state_dict(state_dict=state_dict)
+    _load_state_dict(model, state_dict)
     return model
 
 def force_model(device,params='trained_param/qm7x/force.pth'):
@@ -37,7 +54,7 @@ def force_model(device,params='trained_param/qm7x/force.pth'):
                     rc=5.0,
                     dropout=0.0,
                     use_cutoff=False,
-                    max_atomic_number=17,
+                    max_atomic_number=118,
                     atom_ref=None,
                     scale=1.0,
                     scalar_outsize=1,
@@ -47,7 +64,7 @@ def force_model(device,params='trained_param/qm7x/force.pth'):
                     out_type='scalar',
                     grad_type='force',
                     device=device)
-    model.load_state_dict(state_dict=state_dict)
+    _load_state_dict(model, state_dict)
     return model
 
 def charge_model(device,params='trained_param/qm9spectra/npacharge.pth'):
@@ -62,7 +79,7 @@ def charge_model(device,params='trained_param/qm9spectra/npacharge.pth'):
                  rc=5.0,
                  dropout=0.0,
                  use_cutoff=False,
-                 max_atomic_number=9,
+                 max_atomic_number=118,
                  atom_ref=None,
                  scale=1.0,
                  scalar_outsize=1,
@@ -72,7 +89,7 @@ def charge_model(device,params='trained_param/qm9spectra/npacharge.pth'):
                  out_type='scalar',
                  grad_type=None,
                  device=device)
-    model.load_state_dict(state_dict=state_dict)
+    _load_state_dict(model, state_dict)
     return model
 
 def dipole_model(device,params='trained_param/qm9spectra/dipole.pth'):
@@ -87,7 +104,7 @@ def dipole_model(device,params='trained_param/qm9spectra/dipole.pth'):
                  rc=5.0,
                  dropout=0.0,
                  use_cutoff=False,
-                 max_atomic_number=9,
+                 max_atomic_number=118,
                  atom_ref=None,
                  scale=1.0,
                  scalar_outsize=1,
@@ -97,7 +114,7 @@ def dipole_model(device,params='trained_param/qm9spectra/dipole.pth'):
                  out_type='dipole',
                  grad_type=None,
                  device=device)
-    model.load_state_dict(state_dict=state_dict)
+    _load_state_dict(model, state_dict)
     return model
 
 def polar_model(device,params='trained_param/qm9spectra/polar.pth'):
@@ -112,7 +129,7 @@ def polar_model(device,params='trained_param/qm9spectra/polar.pth'):
                  rc=5.0,
                  dropout=0.0,
                  use_cutoff=False,
-                 max_atomic_number=9,
+                 max_atomic_number=118,
                  atom_ref=None,
                  scale=1.0,
                  scalar_outsize=2,
@@ -122,7 +139,7 @@ def polar_model(device,params='trained_param/qm9spectra/polar.pth'):
                  out_type='2_tensor',
                  grad_type=None,
                  device=device)
-    model.load_state_dict(state_dict=state_dict)
+    _load_state_dict(model, state_dict)
     return model
 
 def quadrupole_model(device,params='trained_param/qm9spectra/quadrupole.pth'):
@@ -137,7 +154,7 @@ def quadrupole_model(device,params='trained_param/qm9spectra/quadrupole.pth'):
                  rc=5.0,
                  dropout=0.0,
                  use_cutoff=False,
-                 max_atomic_number=9,
+                 max_atomic_number=118,
                  atom_ref=None,
                  scale=1.0,
                  scalar_outsize=2,
@@ -147,7 +164,7 @@ def quadrupole_model(device,params='trained_param/qm9spectra/quadrupole.pth'):
                  out_type='2_tensor',
                  grad_type=None,
                  device=device)
-    model.load_state_dict(state_dict=state_dict)
+    _load_state_dict(model, state_dict)
     return model
 
 def hyperpolar_model(device,params='trained_param/qm9spectra/hyperpolar.pth'):
@@ -162,7 +179,7 @@ def hyperpolar_model(device,params='trained_param/qm9spectra/hyperpolar.pth'):
                  rc=5.0,
                  dropout=0.0,
                  use_cutoff=False,
-                 max_atomic_number=9,
+                 max_atomic_number=118,
                  atom_ref=None,
                  scale=1.0,
                  scalar_outsize=2,
@@ -172,7 +189,7 @@ def hyperpolar_model(device,params='trained_param/qm9spectra/hyperpolar.pth'):
                  out_type='3_tensor',
                  grad_type=None,
                  device=device)
-    model.load_state_dict(state_dict=state_dict)
+    _load_state_dict(model, state_dict)
     return model
 
 def octapole_model(device,params='trained_param/qm9spectra/octapole.pth'):
@@ -187,7 +204,7 @@ def octapole_model(device,params='trained_param/qm9spectra/octapole.pth'):
                  rc=5.0,
                  dropout=0.0,
                  use_cutoff=False,
-                 max_atomic_number=9,
+                 max_atomic_number=118,
                  atom_ref=None,
                  scale=1.0,
                  scalar_outsize=2,
@@ -197,7 +214,7 @@ def octapole_model(device,params='trained_param/qm9spectra/octapole.pth'):
                  out_type='3_tensor',
                  grad_type=None,
                  device=device)
-    model.load_state_dict(state_dict=state_dict)
+    _load_state_dict(model, state_dict)
     return model
 
 def Hi_model(device,params='trained_param/qm9spectra/Hi.pth'):
@@ -212,7 +229,7 @@ def Hi_model(device,params='trained_param/qm9spectra/Hi.pth'):
                     rc=5.0,
                     dropout=0.0,
                     use_cutoff=False,
-                    max_atomic_number=9,
+                    max_atomic_number=118,
                     atom_ref=None,
                     scale=1.0,
                     scalar_outsize=1,
@@ -222,7 +239,7 @@ def Hi_model(device,params='trained_param/qm9spectra/Hi.pth'):
                     out_type='scalar',
                     grad_type='Hi',
                     device=device)
-    model.load_state_dict(state_dict=state_dict)
+    _load_state_dict(model, state_dict)
     return model
 
 def Hij_model(device,params='trained_param/qm9spectra/Hij.pth'):
@@ -237,7 +254,7 @@ def Hij_model(device,params='trained_param/qm9spectra/Hij.pth'):
                     rc=5.0,
                     dropout=0.0,
                     use_cutoff=False,
-                    max_atomic_number=9,
+                    max_atomic_number=118,
                     atom_ref=None,
                     scale=1.0,
                     scalar_outsize=1,
@@ -247,7 +264,7 @@ def Hij_model(device,params='trained_param/qm9spectra/Hij.pth'):
                     out_type='scalar',
                     grad_type='Hij',
                     device=device)
-    model.load_state_dict(state_dict=state_dict)
+    _load_state_dict(model, state_dict)
     return model
 
 def dedipole_model(device,params='trained_param/qm9spectra/dedipole.pth'):
@@ -262,7 +279,7 @@ def dedipole_model(device,params='trained_param/qm9spectra/dedipole.pth'):
                  rc=5.0,
                  dropout=0.0,
                  use_cutoff=False,
-                 max_atomic_number=9,
+                 max_atomic_number=118,
                  atom_ref=None,
                  scale=1.0,
                  scalar_outsize=1,
@@ -272,7 +289,7 @@ def dedipole_model(device,params='trained_param/qm9spectra/dedipole.pth'):
                  out_type='dipole',
                  grad_type='dipole',
                  device=device)
-    model.load_state_dict(state_dict=state_dict)
+    _load_state_dict(model, state_dict)
     return model
 
 def depolar_model(device,params='trained_param/qm9spectra/depolar.pth'):
@@ -287,7 +304,7 @@ def depolar_model(device,params='trained_param/qm9spectra/depolar.pth'):
                  rc=5.0,
                  dropout=0.0,
                  use_cutoff=False,
-                 max_atomic_number=9,
+                 max_atomic_number=118,
                  atom_ref=None,
                  scale=1.0,
                  scalar_outsize=2,
@@ -297,7 +314,7 @@ def depolar_model(device,params='trained_param/qm9spectra/depolar.pth'):
                  out_type='2_tensor',
                  grad_type='polar',
                  device=device)
-    model.load_state_dict(state_dict=state_dict)
+    _load_state_dict(model, state_dict)
     return model
 
 def nmr_model(device,params):
@@ -312,7 +329,7 @@ def nmr_model(device,params):
                     rc=5.0,
                     dropout=0.0,
                     use_cutoff=False,
-                    max_atomic_number=9,
+                    max_atomic_number=118,
                     atom_ref=None,
                     scale=1.0,
                     scalar_outsize=1,
@@ -322,7 +339,7 @@ def nmr_model(device,params):
                     out_type='scalar',
                     grad_type=None,
                     device=device)
-    model.load_state_dict(state_dict=state_dict)
+    _load_state_dict(model, state_dict)
     return model
 
 def uv_model(device,params='trained_param/qm9spectra/borden_os.pth'):
@@ -337,7 +354,7 @@ def uv_model(device,params='trained_param/qm9spectra/borden_os.pth'):
                     rc=5.0,
                     dropout=0.0,
                     use_cutoff=False,
-                    max_atomic_number=9,
+                    max_atomic_number=118,
                     atom_ref=None,
                     scale=1.0,
                     scalar_outsize=240,
@@ -347,5 +364,5 @@ def uv_model(device,params='trained_param/qm9spectra/borden_os.pth'):
                     out_type='scalar',
                     grad_type=None,
                     device=device)
-    model.load_state_dict(state_dict=state_dict)
+    _load_state_dict(model, state_dict)
     return model
