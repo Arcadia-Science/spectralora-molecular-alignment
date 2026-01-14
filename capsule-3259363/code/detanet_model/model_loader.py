@@ -1,10 +1,37 @@
 import torch
+from pathlib import Path
 from .detanet import DetaNet
+
+def _resolve_params(params, task_name=None):
+    if params is None:
+        return params
+    default_path = Path(params)
+    if task_name is None:
+        task_name = default_path.stem
+    base_dir = default_path.parent
+    if base_dir.name != "trained_param" and base_dir.parent.name == "trained_param":
+        base_dir = base_dir.parent
+
+    candidates = []
+    if default_path.exists():
+        candidates.append(default_path)
+    for name in (f"{task_name}.pth", f"latest_{task_name}.pth", f"{task_name}_latest.pth"):
+        candidate = base_dir / name
+        if candidate.exists():
+            candidates.append(candidate)
+    if not candidates:
+        return str(default_path)
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return str(candidates[0])
 
 def _pad_tensor(source, target_shape):
     if source.shape == target_shape:
         return source
-    result = source.new_zeros(target_shape)
+    result = source.new_empty(target_shape)
+    if result.dim() >= 2:
+        torch.nn.init.xavier_uniform_(result)
+    else:
+        result.uniform_(-0.05, 0.05)
     slices = tuple(slice(0, min(s, t)) for s, t in zip(source.shape, target_shape))
     result[slices] = source[slices]
     return result
@@ -18,6 +45,7 @@ def _load_state_dict(model, state_dict):
     model.load_state_dict(state_dict=state_dict)
 
 def scalar_model(device,params='trained_param/qm7x/energy.pth',max_number=118):
+    params = _resolve_params(params)
     state_dict = torch.load(params)
     model = DetaNet(num_features=128,
                     act='swish',
@@ -43,6 +71,7 @@ def scalar_model(device,params='trained_param/qm7x/energy.pth',max_number=118):
     return model
 
 def force_model(device,params='trained_param/qm7x/force.pth'):
+    params = _resolve_params(params)
     state_dict = torch.load(params)
     model = DetaNet(num_features=128,
                     act='swish',
@@ -68,6 +97,7 @@ def force_model(device,params='trained_param/qm7x/force.pth'):
     return model
 
 def charge_model(device,params='trained_param/qm9spectra/npacharge.pth'):
+    params = _resolve_params(params)
     state_dict=torch.load(params)
     model = DetaNet(num_features=128,
                  act='swish',
@@ -93,6 +123,7 @@ def charge_model(device,params='trained_param/qm9spectra/npacharge.pth'):
     return model
 
 def dipole_model(device,params='trained_param/qm9spectra/dipole.pth'):
+    params = _resolve_params(params)
     state_dict=torch.load(params)
     model = DetaNet(num_features=128,
                  act='swish',
@@ -118,6 +149,7 @@ def dipole_model(device,params='trained_param/qm9spectra/dipole.pth'):
     return model
 
 def polar_model(device,params='trained_param/qm9spectra/polar.pth'):
+    params = _resolve_params(params)
     state_dict=torch.load(params)
     model = DetaNet(num_features=128,
                  act='swish',
@@ -143,6 +175,7 @@ def polar_model(device,params='trained_param/qm9spectra/polar.pth'):
     return model
 
 def quadrupole_model(device,params='trained_param/qm9spectra/quadrupole.pth'):
+    params = _resolve_params(params)
     state_dict=torch.load(params)
     model = DetaNet(num_features=128,
                  act='swish',
@@ -168,6 +201,7 @@ def quadrupole_model(device,params='trained_param/qm9spectra/quadrupole.pth'):
     return model
 
 def hyperpolar_model(device,params='trained_param/qm9spectra/hyperpolar.pth'):
+    params = _resolve_params(params)
     state_dict=torch.load(params)
     model = DetaNet(num_features=128,
                  act='swish',
@@ -193,6 +227,7 @@ def hyperpolar_model(device,params='trained_param/qm9spectra/hyperpolar.pth'):
     return model
 
 def octapole_model(device,params='trained_param/qm9spectra/octapole.pth'):
+    params = _resolve_params(params)
     state_dict=torch.load(params)
     model = DetaNet(num_features=128,
                  act='swish',
@@ -218,6 +253,7 @@ def octapole_model(device,params='trained_param/qm9spectra/octapole.pth'):
     return model
 
 def Hi_model(device,params='trained_param/qm9spectra/Hi.pth'):
+    params = _resolve_params(params)
     state_dict = torch.load(params)
     model = DetaNet(num_features=128,
                     act='swish',
@@ -243,6 +279,7 @@ def Hi_model(device,params='trained_param/qm9spectra/Hi.pth'):
     return model
 
 def Hij_model(device,params='trained_param/qm9spectra/Hij.pth'):
+    params = _resolve_params(params)
     state_dict = torch.load(params)
     model = DetaNet(num_features=128,
                     act='swish',
@@ -268,6 +305,7 @@ def Hij_model(device,params='trained_param/qm9spectra/Hij.pth'):
     return model
 
 def dedipole_model(device,params='trained_param/qm9spectra/dedipole.pth'):
+    params = _resolve_params(params)
     state_dict=torch.load(params)
     model = DetaNet(num_features=128,
                  act='swish',
@@ -293,6 +331,7 @@ def dedipole_model(device,params='trained_param/qm9spectra/dedipole.pth'):
     return model
 
 def depolar_model(device,params='trained_param/qm9spectra/depolar.pth'):
+    params = _resolve_params(params)
     state_dict=torch.load(params)
     model = DetaNet(num_features=128,
                  act='swish',
@@ -318,6 +357,7 @@ def depolar_model(device,params='trained_param/qm9spectra/depolar.pth'):
     return model
 
 def nmr_model(device,params):
+    params = _resolve_params(params)
     state_dict = torch.load(params)
     model = DetaNet(num_features=128,
                     act='swish',
@@ -343,6 +383,7 @@ def nmr_model(device,params):
     return model
 
 def uv_model(device,params='trained_param/qm9spectra/borden_os.pth'):
+    params = _resolve_params(params)
     state_dict = torch.load(params)
     model = DetaNet(num_features=128,
                     act='swish',
