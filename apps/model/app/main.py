@@ -68,7 +68,9 @@ async def healthz() -> dict:
 async def predict_charge(payload: GeometryInput) -> dict:
     pos, z = to_tensors(payload)
     with torch.no_grad():
-        charge = state.charge(z=z, pos=pos).detach().cpu().reshape(-1).tolist()
+        charge = state.charge(z=z, pos=pos)
+        charge = torch.nan_to_num(charge, nan=0.0, posinf=0.0, neginf=0.0)
+        charge = charge.detach().cpu().reshape(-1).tolist()
     return {"charge": charge}
 
 
@@ -119,7 +121,9 @@ async def predict_raman(payload: GeometryInput) -> dict:
 async def predict_uv(payload: GeometryInput) -> dict:
     pos, z = to_tensors(payload)
     with torch.no_grad():
-        uv = state.uv(z=z, pos=pos).detach().cpu().reshape(-1).tolist()
+        uv = state.uv(z=z, pos=pos)
+        uv = torch.nan_to_num(uv, nan=0.0, posinf=0.0, neginf=0.0)
+        uv = uv.detach().cpu().reshape(-1).tolist()
     return {"uv": uv}
 
 
@@ -128,6 +132,8 @@ async def predict_nmr(payload: GeometryInput) -> dict:
     pos, z = to_tensors(payload)
     with torch.no_grad():
         sc, sh = state.nmr(pos=pos, z=z)
+        sc = torch.nan_to_num(sc, nan=0.0, posinf=0.0, neginf=0.0)
+        sh = torch.nan_to_num(sh, nan=0.0, posinf=0.0, neginf=0.0)
     return {
         "sc": sc.detach().cpu().reshape(-1).tolist(),
         "sh": sh.detach().cpu().reshape(-1).tolist(),

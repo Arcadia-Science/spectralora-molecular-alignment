@@ -36,8 +36,11 @@ def hessfreq(Hi,Hij,edge_index,masses,normal=False,linear=False,scale=0.965):
     #Diagonalisation
     eva, evec=torch.linalg.eigh(hessian)
     eva = eva * hess_t
+    eva = torch.nan_to_num(eva, nan=0.0, posinf=0.0, neginf=0.0)
+    eva = torch.clamp(eva, min=0.0)
     freq=torch.pow(eva,0.5)/ (2 * torch.pi)
     freq=freq/cm_hz
+    freq = torch.nan_to_num(freq, nan=0.0, posinf=0.0, neginf=0.0)
     p=-evec.t()*wmasses
     normals = torch.norm(p, dim=1).unsqueeze(1)
     if normal:
@@ -147,6 +150,9 @@ class nn_vib_analysis(torch.nn.Module):
                             , linear=self.linear,scale=self.scale)
             ir_int=chain_rule_ir(dd=dd,modes=modes)
             raman_act=get_raman_act(chain_rule_raman(dp=dp,modes=modes))
+            freq = torch.nan_to_num(freq, nan=0.0, posinf=0.0, neginf=0.0)
+            ir_int = torch.nan_to_num(ir_int, nan=0.0, posinf=0.0, neginf=0.0)
+            raman_act = torch.nan_to_num(raman_act, nan=0.0, posinf=0.0, neginf=0.0)
             return freq,ir_int,raman_act
         else:
             vib_list = []
@@ -162,6 +168,9 @@ class nn_vib_analysis(torch.nn.Module):
                                        , normal=False, linear=self.linear, scale=self.scale)
                 ir_int = chain_rule_ir(dd=dd[batch==n], modes=modes, sers=self.sers)
                 raman_act = get_raman_act(chain_rule_raman(dp=dp[batch==n], modes=modes), sers=self.sers)
+                freq = torch.nan_to_num(freq, nan=0.0, posinf=0.0, neginf=0.0)
+                ir_int = torch.nan_to_num(ir_int, nan=0.0, posinf=0.0, neginf=0.0)
+                raman_act = torch.nan_to_num(raman_act, nan=0.0, posinf=0.0, neginf=0.0)
                 vib_list.append([freq,ir_int, raman_act])
             return vib_list
 
