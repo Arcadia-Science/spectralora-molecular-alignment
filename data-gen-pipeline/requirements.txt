@@ -1,0 +1,9 @@
+# Pipeline-specific ML deps (install in a separate env from root requirements).
+# Requires a compatible PyTorch + PyG stack already installed.
+# For DeepMD pip extras (cpu/gpu/cu11/cu12), follow the official install docs:
+# https://docs.deepmodeling.com/projects/deepmd/en/v3.0.0b2/getting-started/install.html#install-python-interface-with-pip
+mace-torch==0.3.14
+nequip==0.6.2
+deepmd-kit==3.1.2
+e3nn==0.4.4
+ase>=3.22.0
