@@ -8,11 +8,52 @@ import urllib.request
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Optional, Sequence, Tuple
 
 import torch
 
 E_ANGSTROM_TO_DEBYE = 4.80320427
+
+ATOMIC_POLARIZABILITY = {
+    1: 0.667,  # H
+    3: 24.3,  # Li
+    4: 5.6,  # Be
+    5: 3.0,  # B
+    6: 1.76,  # C
+    7: 1.10,  # N
+    8: 0.802,  # O
+    9: 0.557,  # F
+    10: 0.395,  # Ne
+    11: 24.1,  # Na
+    12: 10.6,  # Mg
+    13: 6.8,  # Al
+    14: 5.38,  # Si
+    15: 3.63,  # P
+    16: 2.90,  # S
+    17: 2.18,  # Cl
+    35: 3.05,  # Br
+    53: 5.35,  # I
+}
+
+PAULING_EN = {
+    1: 2.20,
+    3: 0.98,
+    4: 1.57,
+    5: 2.04,
+    6: 2.55,
+    7: 3.04,
+    8: 3.44,
+    9: 3.98,
+    11: 0.93,
+    12: 1.31,
+    13: 1.61,
+    14: 1.90,
+    15: 2.19,
+    16: 2.58,
+    17: 3.16,
+    35: 2.96,
+    53: 2.66,
+}
 
 try:
     from torch_geometric.data import Data
@@ -55,6 +96,8 @@ class PipelineConfig:
     smiles: Sequence[str] = ()
     smiles_file: Optional[Path] = None
     db_path: Optional[Path] = None
+    hdf5_paths: Sequence[Path] = ()
+    hdf5_subset: Sequence[str] = ()
     checkpoint_cache: Path = Path("data-gen-pipeline/checkpoints")
     pos_step: float = 1e-3
     dft_atom_cutoff: int = 20
@@ -84,6 +127,7 @@ class PipelineConfig:
     allow_missing_hyperpolar: bool = False
     allow_missing_polar: bool = False
     allow_missing_dipole: bool = False
+    shard_size: Optional[int] = None
 
 
 @dataclass
@@ -93,6 +137,20 @@ class SmilesItem:
     pos: Optional[torch.Tensor] = None
     z: Optional[torch.Tensor] = None
     edge_index: Optional[torch.Tensor] = None
+    energy: Optional[torch.Tensor] = None
+    dipole: Optional[torch.Tensor] = None
+    npacharge: Optional[torch.Tensor] = None
+    polar: Optional[torch.Tensor] = None
+    quadrupole: Optional[torch.Tensor] = None
+    octapole: Optional[torch.Tensor] = None
+    hyperpolar: Optional[torch.Tensor] = None
+    dedipole: Optional[torch.Tensor] = None
+    depolar: Optional[torch.Tensor] = None
+    mol_key: Optional[str] = None
+    subset: Optional[str] = None
+    source: Optional[str] = None
+    conformer_id: Optional[int] = None
+    field_source: Optional[Dict[str, str]] = None
 
 
 def ensure_data_available() -> None:
@@ -125,6 +183,9 @@ def resolve_checkpoint(path_or_url: Optional[str], cache_dir: Path) -> Optional[
 
 
 def iter_smiles(cfg: PipelineConfig) -> Iterable[SmilesItem]:
+    if cfg.hdf5_paths:
+        yield from iter_hdf5(cfg)
+        return
     if cfg.smiles:
         for idx, smile in enumerate(cfg.smiles, start=1):
             yield SmilesItem(number=idx, smile=smile)
@@ -141,13 +202,199 @@ def iter_smiles(cfg: PipelineConfig) -> Iterable[SmilesItem]:
         conn = sqlite3.connect(cfg.db_path)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
-        cur.execute("SELECT id, SMILES, blob_data FROM molecule ORDER BY id")
+        cur.execute("PRAGMA table_info(molecule)")
+        cols = {row[1] for row in cur.fetchall()}
+        select_cols = ["id", "SMILES", "blob_data"]
+        for name in ("Dx", "Dy", "Dz", "isotropic_pol"):
+            if name in cols:
+                select_cols.append(name)
+        cur.execute(f"SELECT {', '.join(select_cols)} FROM molecule ORDER BY id")
         for row in cur:
             pos, z = parse_blob_geometry(row["blob_data"])
-            yield SmilesItem(number=int(row["id"]), smile=row["SMILES"], pos=pos, z=z)
+            dipole = None
+            if all(name in row.keys() for name in ("Dx", "Dy", "Dz")):
+                dipole = torch.tensor([row["Dx"], row["Dy"], row["Dz"]], dtype=torch.float32).view(1, 3)
+            polar = None
+            if "isotropic_pol" in row.keys() and row["isotropic_pol"] is not None:
+                iso = float(row["isotropic_pol"])
+                polar = torch.eye(3, dtype=torch.float32) * iso
+                polar = polar.unsqueeze(0)
+            field_source = {"pos": "db", "z": "db", "smile": "db"}
+            if dipole is not None:
+                field_source["dipole"] = "db"
+            if polar is not None:
+                field_source["polar"] = "db"
+            yield SmilesItem(
+                number=int(row["id"]),
+                smile=row["SMILES"],
+                pos=pos,
+                z=z,
+                dipole=dipole,
+                polar=polar,
+                field_source=field_source,
+            )
         conn.close()
         return
-    raise RuntimeError("Provide --smiles, --smiles-file, or --db-path")
+    raise RuntimeError("Provide --smiles, --smiles-file, --db-path, or --hdf5-path")
+
+
+def iter_hdf5(cfg: PipelineConfig) -> Iterable[SmilesItem]:
+    try:
+        import h5py
+        import numpy as np
+    except Exception as exc:
+        raise RuntimeError("h5py is required for --hdf5-path datasets.") from exc
+    import gzip
+    import shutil
+    import tempfile
+
+    def _read_str(group, name: str) -> Optional[str]:
+        if name not in group:
+            return None
+        value = group[name][()]
+        if isinstance(value, bytes):
+            return value.decode("utf-8")
+        if isinstance(value, str):
+            return value
+        if isinstance(value, np.ndarray):
+            if value.shape == ():
+                return value.item().decode("utf-8") if hasattr(value.item(), "decode") else str(value.item())
+            if value.size > 0:
+                item = value.reshape(-1)[0]
+                return item.decode("utf-8") if hasattr(item, "decode") else str(item)
+        return str(value)
+
+    def _as_tensor(value, dtype, *, squeeze_last: bool = False) -> Optional[torch.Tensor]:
+        if value is None:
+            return None
+        arr = np.asarray(value)
+        if squeeze_last and arr.ndim > 1 and arr.shape[-1] == 1:
+            arr = arr[..., 0]
+        return torch.tensor(arr, dtype=dtype)
+
+    def _first_dataset(group, names: Sequence[str]):
+        for name in names:
+            if name in group:
+                return group[name]
+        return None
+
+    files: list[Path] = []
+    temp_paths: list[Path] = []
+    for path in cfg.hdf5_paths:
+        if path.is_dir():
+            files.extend(sorted(path.glob("*.h5")))
+            files.extend(sorted(path.glob("*.hdf5")))
+            files.extend(sorted(path.glob("*.h5.gz")))
+            files.extend(sorted(path.glob("*.hdf5.gz")))
+        else:
+            if path.suffix.endswith(".gz"):
+                with gzip.open(path, "rb") as f_in:
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".hdf5")
+                    with tmp:
+                        shutil.copyfileobj(f_in, tmp)
+                temp_paths.append(Path(tmp.name))
+                files.append(Path(tmp.name))
+            else:
+                files.append(path)
+
+    index = 0
+    try:
+        for file_path in files:
+            with h5py.File(file_path, "r") as handle:
+                for mol_key in handle.keys():
+                    group = handle[mol_key]
+                    subset = _read_str(group, "subset")
+                    if cfg.hdf5_subset and (subset is None or subset not in cfg.hdf5_subset):
+                        continue
+
+                    smile = _read_str(group, "smiles") or str(mol_key)
+                    atomic_numbers = group.get("atomic_numbers")
+                    conformations = group.get("conformations")
+                    if atomic_numbers is None or conformations is None:
+                        continue
+
+                    z = torch.tensor(atomic_numbers[()], dtype=torch.long)
+                    energy_ds = _first_dataset(group, ("formation_energy", "dft_total_energy"))
+                    dipole_ds = _first_dataset(group, ("scf_dipoles",))
+                    quadrupole_ds = _first_dataset(group, ("scf_quadrupole", "scf_quadrupoles"))
+                    mbis_charges_ds = _first_dataset(group, ("mbis_charges",))
+                    mbis_dipoles_ds = _first_dataset(group, ("mbis_dipoles",))
+                    mbis_quadrupoles_ds = _first_dataset(group, ("mbis_quadrupoles",))
+                    mbis_octupoles_ds = _first_dataset(group, ("mbis_octupoles",))
+
+                    num_confs = int(conformations.shape[0])
+                    base_source = {
+                        "pos": "dataset",
+                        "z": "dataset",
+                        "smile": "dataset",
+                    }
+                    if energy_ds is not None:
+                        base_source["energy"] = energy_ds.name.split("/")[-1]
+                    if dipole_ds is not None:
+                        base_source["dipole"] = "scf_dipole"
+                    elif mbis_dipoles_ds is not None:
+                        base_source["dipole"] = "mbis_dipole_sum"
+                    if mbis_charges_ds is not None:
+                        base_source["npacharge"] = "mbis_charges"
+                    if quadrupole_ds is not None:
+                        base_source["quadrupole"] = "scf_quadrupole"
+                    if mbis_octupoles_ds is not None:
+                        base_source["octapole"] = "mbis_octupoles_sum"
+                    for conf_id in range(num_confs):
+                        index += 1
+                        if cfg.limit is not None and index > cfg.limit:
+                            return
+                        if cfg.distributed and (index - 1) % cfg.world_size != cfg.rank:
+                            continue
+
+                        pos = torch.tensor(conformations[conf_id], dtype=torch.float32)
+                        energy = _as_tensor(energy_ds[conf_id], torch.float32) if energy_ds is not None else None
+                        if energy is not None and energy.ndim == 0:
+                            energy = energy.view(1, 1)
+
+                        dipole = _as_tensor(dipole_ds[conf_id], torch.float32) if dipole_ds is not None else None
+                        if dipole is None and mbis_dipoles_ds is not None:
+                            dipole = _as_tensor(mbis_dipoles_ds[conf_id], torch.float32)
+                            if dipole is not None:
+                                dipole = dipole.sum(dim=0)
+                        if dipole is not None and dipole.ndim == 1:
+                            dipole = dipole.view(1, 3)
+
+                        charges = _as_tensor(
+                            mbis_charges_ds[conf_id], torch.float32, squeeze_last=True
+                        ) if mbis_charges_ds is not None else None
+                        quad = _as_tensor(quadrupole_ds[conf_id], torch.float32) if quadrupole_ds is not None else None
+                        if quad is not None and quad.ndim == 2:
+                            quad = quad.unsqueeze(0)
+
+                        octa = None
+                        if mbis_octupoles_ds is not None:
+                            octa = _as_tensor(mbis_octupoles_ds[conf_id], torch.float32)
+                            if octa is not None:
+                                octa = octa.sum(dim=0, keepdim=True)
+
+                        yield SmilesItem(
+                            number=index,
+                            smile=smile,
+                            pos=pos,
+                            z=z,
+                            energy=energy,
+                            dipole=dipole,
+                            npacharge=charges,
+                            quadrupole=quad,
+                            octapole=octa,
+                            mol_key=str(mol_key),
+                            subset=subset,
+                            source=file_path.name,
+                            conformer_id=conf_id,
+                            field_source=base_source,
+                        )
+    finally:
+        for tmp in temp_paths:
+            try:
+                tmp.unlink()
+            except Exception:
+                pass
 
 
 def smiles_to_conformer(smile: str, max_attempts: int, optimize: bool) -> Tuple[torch.Tensor, torch.Tensor, "Chem.Mol"]:
@@ -260,6 +507,59 @@ def compute_gasteiger_charges(mol: Optional["Chem.Mol"]) -> torch.Tensor:
         except Exception:
             charges.append(0.0)
     return torch.tensor(charges, dtype=torch.float32)
+
+
+def approximate_charges_from_z(z: torch.Tensor) -> torch.Tensor:
+    en = []
+    for zi in z.detach().cpu().tolist():
+        val = PAULING_EN.get(int(zi))
+        if val is None:
+            val = 0.1 * float(zi)
+        en.append(val)
+    en_t = torch.tensor(en, dtype=torch.float32)
+    en_t = en_t - en_t.mean()
+    scale = en_t.abs().max().clamp(min=1e-6)
+    return en_t / scale * 0.1
+
+
+def approximate_polar_from_z(z: torch.Tensor, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    alpha = []
+    for zi in z.detach().cpu().tolist():
+        val = ATOMIC_POLARIZABILITY.get(int(zi))
+        if val is None:
+            val = 0.2 * float(zi)
+        alpha.append(val)
+    alpha_t = torch.tensor(alpha, dtype=dtype, device=device)
+    total = alpha_t.sum().clamp(min=1e-6)
+    return torch.eye(3, dtype=dtype, device=device) * total
+
+
+def approximate_depolar_from_z(z: torch.Tensor, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    alpha = []
+    for zi in z.detach().cpu().tolist():
+        val = ATOMIC_POLARIZABILITY.get(int(zi))
+        if val is None:
+            val = 0.2 * float(zi)
+        alpha.append(val)
+    alpha_t = torch.tensor(alpha, dtype=dtype, device=device)
+    n = alpha_t.shape[0]
+    depolar = torch.zeros((n, 3, 6), dtype=dtype, device=device)
+    scale = alpha_t / alpha_t.mean().clamp(min=1e-6)
+    for i in range(n):
+        depolar[i, :, 0] = 1e-3 * scale[i]
+        depolar[i, :, 1] = 1e-3 * scale[i]
+        depolar[i, :, 2] = 1e-3 * scale[i]
+    return depolar
+
+
+def approximate_hyperpolar_from_polar(polar: torch.Tensor) -> torch.Tensor:
+    dtype = polar.dtype
+    device = polar.device
+    hyper = torch.zeros((1, 3, 3, 3), dtype=dtype, device=device)
+    beta = polar.mean().clamp(min=1e-6) * 0.1
+    for i in range(3):
+        hyper[0, i, i, i] = beta
+    return hyper
 
 
 def atomic_masses_from_z(z: torch.Tensor) -> torch.Tensor:
@@ -452,9 +752,11 @@ def build_data_from_smiles(
     pos, z, mol = geometry_from_item(item, cfg)
     pos = pos.to(cfg.device)
     z = z.to(cfg.device)
+    source_map: Dict[str, str] = dict(item.field_source) if item.field_source else {}
 
     if item.edge_index is not None:
         edge_index = item.edge_index.to(cfg.device)
+        source_map.setdefault("edge_index", "provided")
     else:
         edge_index, _ = radius_graph_from_k(
             pos,
@@ -463,15 +765,164 @@ def build_data_from_smiles(
             clamp_max=cfg.graph_clamp_max,
             device=cfg.device,
         )
+        source_map.setdefault("edge_index", "radius_graph")
 
-    deepmd_supported = dipole_backend is not None and dipole_backend.supports(z)
-    if polar_backend is not None:
-        deepmd_supported = deepmd_supported and polar_backend.supports(z)
+    source_map.setdefault("pos", "provided" if item.pos is not None else "rdkit")
+    source_map.setdefault("z", "provided" if item.z is not None else "rdkit")
+    source_map.setdefault("smile", "input")
+    source_map.setdefault("number", "input")
+
     dipole_supported = dipole_backend is not None and dipole_backend.supports(z)
     polar_supported = polar_backend is not None and polar_backend.supports(z)
-    deepmd_supported = (dipole_supported or cfg.allow_missing_dipole) and (
-        polar_supported or cfg.allow_missing_polar
-    )
+
+    if item.npacharge is not None:
+        charges = item.npacharge
+        source_map.setdefault("npacharge", "dataset")
+    else:
+        charges = compute_gasteiger_charges(mol)
+        if charges is None or charges.numel() == 0:
+            charges = approximate_charges_from_z(z).to(dtype=pos.dtype)
+            source_map.setdefault("npacharge", "charge_approx")
+        else:
+            source_map.setdefault("npacharge", "gasteiger")
+    if charges.numel() != z.shape[0]:
+        charges = approximate_charges_from_z(z).to(dtype=pos.dtype)
+        source_map.setdefault("npacharge", "charge_approx")
+    charges = charges.to(cfg.device, dtype=pos.dtype)
+    masses = atomic_masses_from_z(z).to(cfg.device, dtype=pos.dtype)
+
+    dipole = item.dipole.to(cfg.device, dtype=pos.dtype) if item.dipole is not None else None
+    polar = item.polar.to(cfg.device, dtype=pos.dtype) if item.polar is not None else None
+    hyperpolar = item.hyperpolar.to(cfg.device, dtype=pos.dtype) if item.hyperpolar is not None else None
+    dedipole = item.dedipole.to(cfg.device, dtype=pos.dtype) if item.dedipole is not None else None
+    depolar = item.depolar.to(cfg.device, dtype=pos.dtype) if item.depolar is not None else None
+
+    if dipole is not None and dipole.ndim == 1:
+        dipole = dipole.view(1, 3)
+    if polar is not None and polar.ndim == 2:
+        polar = polar.unsqueeze(0)
+    if hyperpolar is not None and hyperpolar.ndim == 3:
+        hyperpolar = hyperpolar.unsqueeze(0)
+
+    need_dipole = dipole is None
+    need_polar = polar is None
+    need_hyper = hyperpolar is None
+
+    if dipole is not None:
+        source_map.setdefault("dipole", "dataset")
+    if polar is not None:
+        source_map.setdefault("polar", "dataset")
+    if hyperpolar is not None:
+        source_map.setdefault("hyperpolar", "dataset")
+    if dedipole is not None:
+        source_map.setdefault("dedipole", "dataset")
+    if depolar is not None:
+        source_map.setdefault("depolar", "dataset")
+
+    if need_dipole and cfg.allow_missing_dipole and not dipole_supported:
+        dipole = approximate_dipole_from_charges(pos, charges, masses).reshape(1, 3)
+        if dedipole is None:
+            dedipole = approximate_dedipole_from_charges(charges, masses)
+        source_map.setdefault("dipole", "charge_approx")
+        source_map.setdefault("dedipole", "charge_approx")
+        need_dipole = False
+
+    if need_polar and cfg.allow_missing_polar and not polar_supported:
+        polar = approximate_polar_from_z(z, pos.dtype, cfg.device).unsqueeze(0)
+        if depolar is None:
+            depolar = approximate_depolar_from_z(z, pos.dtype, cfg.device)
+        source_map.setdefault("polar", "polar_approx")
+        source_map.setdefault("depolar", "polar_approx")
+        need_polar = False
+
+    if need_hyper and cfg.allow_missing_hyperpolar:
+        if polar is None:
+            polar = approximate_polar_from_z(z, pos.dtype, cfg.device).unsqueeze(0)
+            source_map.setdefault("polar", "polar_approx")
+        hyperpolar = approximate_hyperpolar_from_polar(polar)
+        source_map.setdefault("hyperpolar", "hyperpolar_approx")
+        need_hyper = False
+
+    use_dft_props = False
+    if (need_dipole or need_polar or need_hyper) and psi4_backend is not None:
+        use_dft_props = pos.shape[0] <= cfg.dft_atom_cutoff or not (dipole_supported or polar_supported)
+    if use_dft_props:
+        try:
+            dft_dipole, dft_polar, dft_hyper = psi4_backend.properties(
+                pos,
+                z,
+                allow_missing_hyper=cfg.allow_missing_hyperpolar,
+            )
+            if dipole is None:
+                dipole = dft_dipole.to(device=cfg.device, dtype=pos.dtype).reshape(1, 3)
+                source_map.setdefault("dipole", "psi4")
+            if polar is None:
+                polar = dft_polar.to(device=cfg.device, dtype=pos.dtype).unsqueeze(0)
+                source_map.setdefault("polar", "psi4")
+            if hyperpolar is None:
+                hyperpolar = dft_hyper.to(device=cfg.device, dtype=pos.dtype)
+                source_map.setdefault("hyperpolar", "psi4")
+            if dedipole is None:
+                dedipole = finite_diff_dedipole(lambda coords: psi4_backend.dipole(coords, z), pos, cfg.pos_step)
+                source_map.setdefault("dedipole", "derived:psi4")
+            if depolar is None:
+                depolar = finite_diff_depolar(lambda coords: psi4_backend.polar(coords, z), pos, cfg.pos_step)
+                source_map.setdefault("depolar", "derived:psi4")
+            need_dipole = dipole is None
+            need_polar = polar is None
+            need_hyper = hyperpolar is None
+        except Exception:
+            if (need_dipole and not dipole_supported and not cfg.allow_missing_dipole) or (
+                need_polar and not polar_supported and not cfg.allow_missing_polar
+            ):
+                raise
+            use_dft_props = False
+
+    if dipole is None:
+        if dipole_supported:
+            dipole = dipole_backend.dipole(pos, z).reshape(1, 3)
+            if dedipole is None:
+                dedipole = finite_diff_dedipole(lambda coords: dipole_backend.dipole(coords, z), pos, cfg.pos_step)
+            source_map.setdefault("dipole", "deepmd_dipole")
+            source_map.setdefault("dedipole", "derived:deepmd_dipole")
+        elif cfg.allow_missing_dipole:
+            dipole = approximate_dipole_from_charges(pos, charges, masses).reshape(1, 3)
+            if dedipole is None:
+                dedipole = approximate_dedipole_from_charges(charges, masses)
+            source_map.setdefault("dipole", "charge_approx")
+            source_map.setdefault("dedipole", "charge_approx")
+        else:
+            raise RuntimeError("DeepMD dipole model is missing or does not support this element set.")
+
+    if polar is None:
+        if polar_supported:
+            polar = polar_backend.polar(pos, z).unsqueeze(0)
+            if depolar is None:
+                depolar = finite_diff_depolar(lambda coords: polar_backend.polar(coords, z), pos, cfg.pos_step)
+            source_map.setdefault("polar", "deepmd_polar")
+            source_map.setdefault("depolar", "derived:deepmd_polar")
+        elif cfg.allow_missing_polar:
+            polar = approximate_polar_from_z(z, pos.dtype, cfg.device).unsqueeze(0)
+            if depolar is None:
+                depolar = approximate_depolar_from_z(z, pos.dtype, cfg.device)
+            source_map.setdefault("polar", "polar_approx")
+            source_map.setdefault("depolar", "polar_approx")
+        else:
+            raise RuntimeError("Polar model is required for molecules above the DFT atom cutoff.")
+
+    if hyperpolar is None:
+        if polar is None:
+            polar = approximate_polar_from_z(z, pos.dtype, cfg.device).unsqueeze(0)
+            source_map.setdefault("polar", "polar_approx")
+        hyperpolar = approximate_hyperpolar_from_polar(polar)
+        source_map.setdefault("hyperpolar", "hyperpolar_approx")
+
+    if dedipole is None:
+        dedipole = approximate_dedipole_from_charges(charges, masses)
+        source_map.setdefault("dedipole", "charge_approx")
+    if depolar is None:
+        depolar = approximate_depolar_from_z(z, pos.dtype, cfg.device)
+        source_map.setdefault("depolar", "polar_approx")
 
     hessian_supported = True
     if hessian_backend is not None and hasattr(hessian_backend, "supports"):
@@ -479,61 +930,9 @@ def build_data_from_smiles(
     if not hessian_supported and psi4_backend is None:
         raise RuntimeError("Hessian backend does not support this element set; enable Psi4 fallback.")
 
-    use_dft = psi4_backend is not None and (
-        pos.shape[0] <= cfg.dft_atom_cutoff or not deepmd_supported or not hessian_supported
-    )
-
-    charges = compute_gasteiger_charges(mol)
-    if charges.numel() != z.shape[0]:
-        charges = torch.zeros(z.shape[0], dtype=pos.dtype)
-    charges = charges.to(cfg.device, dtype=pos.dtype)
-    masses = atomic_masses_from_z(z).to(cfg.device, dtype=pos.dtype)
-
-    dipole = None
-    polar = None
-    hyperpolar = None
-    if use_dft:
-        try:
-            dipole, polar, hyperpolar = psi4_backend.properties(
-                pos,
-                z,
-                allow_missing_hyper=cfg.allow_missing_hyperpolar,
-            )
-            dipole = dipole.to(device=cfg.device, dtype=pos.dtype).reshape(1, 3)
-            polar = polar.to(device=cfg.device, dtype=pos.dtype).unsqueeze(0)
-            hyperpolar = hyperpolar.to(device=cfg.device, dtype=pos.dtype)
-            dedipole = finite_diff_dedipole(lambda coords: psi4_backend.dipole(coords, z), pos, cfg.pos_step)
-            depolar = finite_diff_depolar(lambda coords: psi4_backend.polar(coords, z), pos, cfg.pos_step)
-        except Exception:
-            if not deepmd_supported:
-                raise
-            use_dft = False
-
-    if not use_dft:
-        if not dipole_supported:
-            if cfg.allow_missing_dipole:
-                dipole = approximate_dipole_from_charges(pos, charges, masses).reshape(1, 3)
-                dedipole = approximate_dedipole_from_charges(charges, masses)
-            else:
-                raise RuntimeError("DeepMD dipole model is missing or does not support this element set.")
-        else:
-            dipole = dipole_backend.dipole(pos, z).reshape(1, 3)
-            dedipole = finite_diff_dedipole(lambda coords: dipole_backend.dipole(coords, z), pos, cfg.pos_step)
-
-        if polar_backend is None or not polar_supported:
-            if cfg.allow_missing_polar:
-                polar = torch.zeros((1, 3, 3), device=cfg.device, dtype=pos.dtype)
-                depolar = torch.zeros((pos.shape[0], 3, 6), device=cfg.device, dtype=pos.dtype)
-            else:
-                raise RuntimeError("Polar model is required for molecules above the DFT atom cutoff.")
-        else:
-            polar = polar_backend.polar(pos, z).unsqueeze(0)
-            depolar = finite_diff_depolar(lambda coords: polar_backend.polar(coords, z), pos, cfg.pos_step)
-
-        hyperpolar = torch.zeros((1, 3, 3, 3), device=cfg.device, dtype=pos.dtype)
-
+    use_dft_hess = psi4_backend is not None and (pos.shape[0] <= cfg.dft_atom_cutoff or not hessian_supported)
     try:
-        if use_dft:
+        if use_dft_hess:
             Hi, Hij = psi4_backend.compute(pos, z, edge_index)
         else:
             Hi, Hij = hessian_backend.compute(pos, z, edge_index)
@@ -542,7 +941,31 @@ def build_data_from_smiles(
             raise
         Hi, Hij = hessian_backend.compute(pos, z, edge_index)
 
-    quadrupole, octapole = compute_multipoles(pos, charges, masses)
+    if use_dft_hess:
+        hess_source = "psi4"
+    else:
+        hess_source = "deepmd_pot" if isinstance(hessian_backend, DeepMDPotHessianBackend) else "mace"
+    source_map.setdefault("Hi", hess_source)
+    source_map.setdefault("Hij", hess_source)
+
+    if item.quadrupole is not None:
+        quadrupole = item.quadrupole.to(cfg.device, dtype=pos.dtype)
+        if quadrupole.ndim == 2:
+            quadrupole = quadrupole.unsqueeze(0)
+        source_map.setdefault("quadrupole", "dataset")
+    if item.octapole is not None:
+        octapole = item.octapole.to(cfg.device, dtype=pos.dtype)
+        if octapole.ndim == 3:
+            octapole = octapole.unsqueeze(0)
+        source_map.setdefault("octapole", "dataset")
+    if item.quadrupole is None or item.octapole is None:
+        quad_calc, octa_calc = compute_multipoles(pos, charges, masses)
+        if item.quadrupole is None:
+            quadrupole = quad_calc
+            source_map.setdefault("quadrupole", "charge_approx")
+        if item.octapole is None:
+            octapole = octa_calc
+            source_map.setdefault("octapole", "charge_approx")
 
     full_hess = assemble_hessian(Hi, Hij, edge_index)
     tran_energy, tran_dipole = compute_vibrational_transitions(
@@ -552,20 +975,99 @@ def build_data_from_smiles(
         dedipole=dedipole.detach() if dedipole is not None else None,
         max_modes=10,
     )
+    source_map.setdefault("tran_energy", f"derived:{hess_source}")
+    source_map.setdefault("tran_dipole", f"derived:{hess_source}")
 
-    if use_dft and psi4_backend is not None and hasattr(psi4_backend, "energy"):
+    if item.energy is not None:
+        energy = item.energy.to(cfg.device, dtype=pos.dtype)
+        source_map.setdefault("energy", "dataset")
+    elif use_dft_hess and psi4_backend is not None and hasattr(psi4_backend, "energy"):
         energy = psi4_backend.energy(pos, z)
+        source_map.setdefault("energy", "psi4")
     elif hasattr(hessian_backend, "energy"):
         energy = hessian_backend.energy(pos, z)
+        if isinstance(hessian_backend, DeepMDPotHessianBackend):
+            source_map.setdefault("energy", "deepmd_pot")
+        else:
+            source_map.setdefault("energy", "mace")
     else:
         energy = torch.zeros((1, 1), dtype=pos.dtype, device=cfg.device)
+        source_map.setdefault("energy", "zero_fill")
 
     atomic_energy = None
-    if not use_dft and cfg.deepmd_atomic_energy and hasattr(hessian_backend, "atomic_energy"):
+    if (not use_dft_hess) and cfg.deepmd_atomic_energy and hasattr(hessian_backend, "atomic_energy"):
         try:
             atomic_energy = hessian_backend.atomic_energy(pos, z)
+            source_map.setdefault("atomic_energy", "deepmd_pot")
         except Exception:
             atomic_energy = None
+
+    dataset_sources = {
+        "dataset",
+        "formation_energy",
+        "dft_total_energy",
+        "scf_dipole",
+        "scf_quadrupole",
+        "mbis_charges",
+        "mbis_dipole_sum",
+        "mbis_octupoles_sum",
+    }
+    input_sources = {"input"}
+    provided_sources = {"provided", "db"}
+    ml_sources = {"mace", "deepmd_pot", "deepmd_dipole", "deepmd_polar"}
+    heuristic_sources = {"charge_approx", "gasteiger", "zero_fill"}
+
+    def is_generated(source: str) -> bool:
+        return source not in dataset_sources and source not in input_sources and source not in provided_sources
+
+    def is_imputed(source: str) -> bool:
+        if source in ml_sources or source in heuristic_sources:
+            return True
+        if source.startswith("derived:"):
+            base = source.split(":", 1)[1]
+            return base in ml_sources or base in heuristic_sources
+        return False
+
+    confidence_base = {
+        "dataset": 0.99,
+        "db": 0.99,
+        "summary_csv": 0.98,
+        "des5m_energy": 0.98,
+        "formation_energy": 0.99,
+        "dft_total_energy": 0.99,
+        "scf_dipole": 0.99,
+        "scf_quadrupole": 0.99,
+        "mbis_charges": 0.98,
+        "mbis_dipole_sum": 0.98,
+        "mbis_octupoles_sum": 0.98,
+        "psi4": 0.95,
+        "deepmd_pot": 0.85,
+        "deepmd_dipole": 0.82,
+        "deepmd_polar": 0.80,
+        "mace": 0.80,
+        "radius_graph": 0.85,
+        "rdkit": 0.75,
+        "provided": 0.9,
+        "input": 0.9,
+        "gasteiger": 0.45,
+        "charge_approx": 0.4,
+        "polar_approx": 0.35,
+        "hyperpolar_approx": 0.3,
+        "zero_fill": 0.05,
+    }
+
+    def confidence_for_source(source: str) -> float:
+        base = source
+        if source.startswith("derived:"):
+            base = source.split(":", 1)[1]
+        value = confidence_base.get(base, 0.5)
+        if source.startswith("derived:"):
+            value = max(0.0, value - 0.05)
+        return value
+
+    field_generated = {key: is_generated(value) for key, value in source_map.items()}
+    field_imputed = {key: is_imputed(value) for key, value in source_map.items()}
+    field_confidence = {key: confidence_for_source(value) for key, value in source_map.items()}
 
     data_fields = dict(
         edge_index=edge_index,
@@ -586,7 +1088,19 @@ def build_data_from_smiles(
         depolar=depolar,
         tran_dipole=tran_dipole,
         tran_energy=tran_energy,
+        field_source=source_map,
+        field_generated=field_generated,
+        field_imputed=field_imputed,
+        field_confidence=field_confidence,
     )
+    if item.mol_key is not None:
+        data_fields["mol_key"] = item.mol_key
+    if item.subset is not None:
+        data_fields["subset"] = item.subset
+    if item.source is not None:
+        data_fields["source"] = item.source
+    if item.conformer_id is not None:
+        data_fields["conformer_id"] = item.conformer_id
     if atomic_energy is not None:
         data_fields["atomic_energy"] = atomic_energy
     data = Data(**data_fields)
@@ -604,12 +1118,141 @@ def write_data(data: Data, cfg: PipelineConfig, manifest) -> None:
     manifest.write(json.dumps({"id": data.number, "path": str(out_path), "smile": data.smile}) + "\n")
 
 
+class ShardWriter:
+    def __init__(self, cfg: PipelineConfig, manifest) -> None:
+        if cfg.shard_size is None or cfg.shard_size <= 0:
+            raise ValueError("shard_size must be a positive integer.")
+        self.cfg = cfg
+        self.manifest = manifest
+        self.buffer: list[Data] = []
+        self.shard_idx = 0
+
+    def add(self, data: Data) -> None:
+        if self.cfg.save_device is not None:
+            data = data.to(self.cfg.save_device)
+        self.buffer.append(data)
+        if len(self.buffer) >= self.cfg.shard_size:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self.buffer:
+            return
+        out_dir = self.cfg.output_dir
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"shard_{self.shard_idx:06d}.pt"
+        torch.save(self.buffer, out_path)
+        start_id = getattr(self.buffer[0], "number", None)
+        end_id = getattr(self.buffer[-1], "number", None)
+        self.manifest.write(
+            json.dumps(
+                {
+                    "shard": str(out_path),
+                    "count": len(self.buffer),
+                    "start_id": start_id,
+                    "end_id": end_id,
+                }
+            )
+            + "\n"
+        )
+        self.buffer.clear()
+        self.shard_idx += 1
+
+
+def run_pipeline(cfg: PipelineConfig, items_iter: Iterable[SmilesItem], total: Optional[int] = None) -> None:
+    os.environ.setdefault("CACHED_PATH_CACHE_ROOT", str(cfg.checkpoint_cache / "cache"))
+    mace_path = resolve_checkpoint(str(cfg.mace_model), cfg.checkpoint_cache)
+    deepmd_pot_path = resolve_checkpoint(str(cfg.deepmd_pot_model), cfg.checkpoint_cache) if cfg.deepmd_pot_model else None
+
+    dipole_backend = None
+    polar_backend = None
+    if cfg.dipole_model is not None:
+        dipole_backend = DeepMDDipoleBackend(
+            device=cfg.device,
+            model_path=str(cfg.dipole_model),
+            type_map=cfg.deepmd_type_map,
+            dipole_unit=cfg.deepmd_dipole_unit,
+        )
+    if cfg.polar_model is not None:
+        polar_backend = DeepMDPolarBackend(
+            device=cfg.device,
+            model_path=str(cfg.polar_model),
+            type_map=cfg.deepmd_type_map,
+        )
+
+    if deepmd_pot_path is not None:
+        hessian_backend = DeepMDPotHessianBackend(
+            device=cfg.device,
+            model_path=deepmd_pot_path,
+            type_map=cfg.deepmd_type_map,
+            head=cfg.deepmd_head,
+            step=cfg.pos_step,
+        )
+    else:
+        hessian_backend = MaceHessianBackend(
+            device=cfg.device,
+            model_path=mace_path,
+            use_autograd=True,
+        )
+
+    psi4_backend = None
+    if cfg.psi4_fallback:
+        psi4_backend = Psi4HessianBackend(
+            device=torch.device("cpu"),
+            method=cfg.psi4_method,
+            basis=cfg.psi4_basis,
+            charge=cfg.psi4_charge,
+            multiplicity=cfg.psi4_multiplicity,
+            num_threads=cfg.psi4_threads,
+            memory=cfg.psi4_memory,
+            scf_type=cfg.psi4_scf_type,
+            guess=cfg.psi4_guess,
+            quiet=cfg.psi4_quiet,
+        )
+
+    manifest_path = cfg.output_dir / "manifest.jsonl"
+    cfg.output_dir.mkdir(parents=True, exist_ok=True)
+    with manifest_path.open("w", encoding="utf-8") as manifest:
+        shard_writer = ShardWriter(cfg, manifest) if cfg.shard_size else None
+        processed = 0
+        iterator = items_iter
+        if total is not None:
+            try:
+                from tqdm import tqdm
+
+                iterator = tqdm(items_iter, total=total, desc="generate")
+            except Exception:
+                iterator = items_iter
+        for item in iterator:
+            processed += 1
+            data = build_data_from_smiles(item, cfg, dipole_backend, polar_backend, hessian_backend, psi4_backend)
+            if shard_writer is not None:
+                shard_writer.add(data)
+            else:
+                write_data(data, cfg, manifest)
+            if cfg.log_every and processed % cfg.log_every == 0 and total is None:
+                print(f"processed {processed}")
+        if shard_writer is not None:
+            shard_writer.flush()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate Data objects from SMILES.")
     parser.add_argument("--output-dir", required=True, help="Output directory for .pt files.")
     parser.add_argument("--smiles", action="append", default=[], help="SMILES string (repeatable).")
     parser.add_argument("--smiles-file", type=str, default=None, help="File with SMILES strings (one per line).")
     parser.add_argument("--db-path", type=str, default=None, help="SQLite DB containing a molecule table.")
+    parser.add_argument(
+        "--hdf5-path",
+        action="append",
+        default=[],
+        help="Path to HDF5 dataset file or directory (repeatable).",
+    )
+    parser.add_argument(
+        "--hdf5-subset",
+        action="append",
+        default=[],
+        help="Subset filter for HDF5 datasets (repeatable).",
+    )
     parser.add_argument("--limit", type=int, default=None, help="Limit number of molecules.")
     parser.add_argument("--device", type=str, default=None, help="Device for model execution (cuda/cpu).")
     parser.add_argument("--save-device", type=str, default=None, help="Device for saved tensors (cpu recommended).")
@@ -674,12 +1317,12 @@ def main() -> None:
     parser.add_argument(
         "--allow-missing-hyperpolar",
         action="store_true",
-        help="Allow missing DFT hyperpolarizability (fills zeros).",
+        help="Allow missing DFT hyperpolarizability (fills approximations).",
     )
     parser.add_argument(
         "--allow-missing-polar",
         action="store_true",
-        help="Allow missing polarizability for ML branch (fills zeros).",
+        help="Allow missing polarizability for ML branch (fills approximations).",
     )
     parser.add_argument(
         "--allow-missing-dipole",
@@ -690,6 +1333,12 @@ def main() -> None:
     parser.add_argument("--rdkit-no-opt", action="store_true", help="Disable RDKit geometry optimization.")
     parser.add_argument("--distributed", action="store_true")
     parser.add_argument("--log-every", type=int, default=50)
+    parser.add_argument(
+        "--shard-size",
+        type=int,
+        default=None,
+        help="Write outputs into shard_*.pt files with this many items each.",
+    )
 
     args = parser.parse_args()
 
@@ -708,6 +1357,8 @@ def main() -> None:
         smiles=args.smiles,
         smiles_file=Path(args.smiles_file) if args.smiles_file else None,
         db_path=Path(args.db_path) if args.db_path else None,
+        hdf5_paths=[Path(path) for path in args.hdf5_path],
+        hdf5_subset=args.hdf5_subset,
         pos_step=args.pos_step,
         dft_atom_cutoff=args.dft_atom_cutoff,
         graph_k=args.graph_k,
@@ -738,72 +1389,22 @@ def main() -> None:
         allow_missing_hyperpolar=args.allow_missing_hyperpolar,
         allow_missing_polar=args.allow_missing_polar,
         allow_missing_dipole=args.allow_missing_dipole,
+        shard_size=args.shard_size,
     )
 
-    os.environ.setdefault("CACHED_PATH_CACHE_ROOT", str(cfg.checkpoint_cache / "cache"))
-    mace_path = resolve_checkpoint(str(cfg.mace_model), cfg.checkpoint_cache)
-    deepmd_pot_path = resolve_checkpoint(str(cfg.deepmd_pot_model), cfg.checkpoint_cache) if cfg.deepmd_pot_model else None
-
-    dipole_backend = None
-    polar_backend = None
-    if cfg.dipole_model is not None:
-        dipole_backend = DeepMDDipoleBackend(
-            device=cfg.device,
-            model_path=str(cfg.dipole_model),
-            type_map=cfg.deepmd_type_map,
-            dipole_unit=cfg.deepmd_dipole_unit,
-        )
-    if cfg.polar_model is not None:
-        polar_backend = DeepMDPolarBackend(
-            device=cfg.device,
-            model_path=str(cfg.polar_model),
-            type_map=cfg.deepmd_type_map,
-        )
-
-    if deepmd_pot_path is not None:
-        hessian_backend = DeepMDPotHessianBackend(
-            device=cfg.device,
-            model_path=deepmd_pot_path,
-            type_map=cfg.deepmd_type_map,
-            head=cfg.deepmd_head,
-            step=cfg.pos_step,
-        )
+    if cfg.hdf5_paths:
+        items_iter = iter_smiles(cfg)
+        total = None
     else:
-        hessian_backend = MaceHessianBackend(
-            device=cfg.device,
-            model_path=mace_path,
-            use_autograd=True,
-        )
+        items = list(iter_smiles(cfg))
+        if cfg.distributed:
+            items = items[cfg.rank :: cfg.world_size]
+        if cfg.limit is not None:
+            items = items[: cfg.limit]
+        items_iter = iter(items)
+        total = len(items)
 
-    psi4_backend = None
-    if cfg.psi4_fallback:
-        psi4_backend = Psi4HessianBackend(
-            device=torch.device("cpu"),
-            method=cfg.psi4_method,
-            basis=cfg.psi4_basis,
-            charge=cfg.psi4_charge,
-            multiplicity=cfg.psi4_multiplicity,
-            num_threads=cfg.psi4_threads,
-            memory=cfg.psi4_memory,
-            scf_type=cfg.psi4_scf_type,
-            guess=cfg.psi4_guess,
-            quiet=cfg.psi4_quiet,
-        )
-
-    items = list(iter_smiles(cfg))
-    if cfg.distributed:
-        items = items[cfg.rank :: cfg.world_size]
-    if cfg.limit is not None:
-        items = items[: cfg.limit]
-
-    manifest_path = cfg.output_dir / "manifest.jsonl"
-    cfg.output_dir.mkdir(parents=True, exist_ok=True)
-    with manifest_path.open("w", encoding="utf-8") as manifest:
-        for idx, item in enumerate(items, start=1):
-            data = build_data_from_smiles(item, cfg, dipole_backend, polar_backend, hessian_backend, psi4_backend)
-            write_data(data, cfg, manifest)
-            if idx % cfg.log_every == 0:
-                print(f"processed {idx}/{len(items)}")
+    run_pipeline(cfg, items_iter, total)
 
 
 if __name__ == "__main__":

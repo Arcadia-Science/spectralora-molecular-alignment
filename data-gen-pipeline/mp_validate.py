@@ -70,7 +70,16 @@ def _init_worker(
 
 
 def _compute_one(idx: int):
-    from torchmetrics.functional import mean_absolute_error
+    def _mae(a: torch.Tensor, b: torch.Tensor) -> float:
+        return torch.mean(torch.abs(a - b)).item()
+
+    def _edge_list(edge_index: torch.Tensor):
+        if edge_index.numel() == 0:
+            return []
+        return edge_index.detach().cpu().to(torch.long).t().tolist()
+
+    def _edge_set(edge_index: torch.Tensor):
+        return {tuple(pair) for pair in _edge_list(edge_index)}
 
     d = _DATASET[idx]
     item = pipeline.SmilesItem(
@@ -87,18 +96,73 @@ def _compute_one(idx: int):
     )
 
     local_errors = defaultdict(list)
-    shape_errors = 0
+    shape_errors = defaultdict(int)
 
     for key in d.keys():
-        if key in ("smile", "number"):
+        if key in (
+            "smile",
+            "number",
+            "field_source",
+            "field_generated",
+            "field_imputed",
+            "field_confidence",
+            "subset",
+            "source",
+            "mol_key",
+            "conformer_id",
+        ):
             continue
-        try:
-            diff = mean_absolute_error(getattr(d, key), getattr(pred, key)).item()
-            local_errors[key].append(diff)
-        except Exception:
-            shape_errors += 1
+        if not hasattr(pred, key):
+            shape_errors[key] += 1
+            continue
 
-    return local_errors, shape_errors, len(d.keys()) - 2
+        try:
+            target = getattr(d, key)
+            estimate = getattr(pred, key)
+            if not isinstance(target, torch.Tensor) or not isinstance(estimate, torch.Tensor):
+                shape_errors[key] += 1
+                continue
+
+            if key == "edge_index":
+                tgt_edges = _edge_set(target)
+                pred_edges = _edge_set(estimate)
+                union = tgt_edges | pred_edges
+                if not union:
+                    local_errors[key].append(0.0)
+                else:
+                    jaccard = len(tgt_edges & pred_edges) / len(union)
+                    local_errors[key].append(1.0 - jaccard)
+                continue
+
+            if key == "Hij":
+                tgt_edges = _edge_set(d.edge_index)
+                pred_edges = _edge_set(pred.edge_index)
+                if target.shape == estimate.shape and tgt_edges == pred_edges:
+                    local_errors[key].append(_mae(target, estimate))
+                    continue
+                # Align by edge intersection when possible.
+                if tgt_edges and pred_edges:
+                    tgt_map = {tuple(edge): idx for idx, edge in enumerate(_edge_list(d.edge_index))}
+                    pred_map = {tuple(edge): idx for idx, edge in enumerate(_edge_list(pred.edge_index))}
+                    common = tgt_edges & pred_edges
+                    if common:
+                        tgt_idx = torch.tensor([tgt_map[e] for e in common], dtype=torch.long)
+                        pred_idx = torch.tensor([pred_map[e] for e in common], dtype=torch.long)
+                        local_errors[key].append(_mae(target[tgt_idx], estimate[pred_idx]))
+                        continue
+                shape_errors[key] += 1
+                continue
+
+            if target.shape != estimate.shape:
+                shape_errors[key] += 1
+                continue
+
+            local_errors[key].append(_mae(target, estimate))
+        except Exception:
+            shape_errors[key] += 1
+
+    denom = len([k for k in d.keys() if k not in ("smile", "number")])
+    return local_errors, dict(shape_errors), denom
 
 
 def run_validation(
@@ -114,8 +178,10 @@ def run_validation(
 ):
     error_dict: dict[str, list[float]] = defaultdict(list)
     shape_error = 0
+    shape_error_by_key: dict[str, int] = defaultdict(int)
     denom_per_item = None
 
+    indices = list(indices)
     ctx = mp.get_context("spawn")
     with ProcessPoolExecutor(
         max_workers=max_workers,
@@ -139,14 +205,17 @@ def run_validation(
             iterator = as_completed(futures)
         for fut in iterator:
             local_errors, local_shape_errors, denom = fut.result()
-            shape_error += local_shape_errors
+            shape_error += sum(local_shape_errors.values())
+            for key, count in local_shape_errors.items():
+                shape_error_by_key[key] += count
             denom_per_item = denom
             for key, vals in local_errors.items():
                 error_dict[key].extend(vals)
 
-    total_denom = len(list(indices)) * (denom_per_item if denom_per_item is not None else 1)
+    total_denom = len(indices) * (denom_per_item if denom_per_item is not None else 1)
     return {
         "shape_error": shape_error,
         "shape_fraction": shape_error / total_denom if total_denom else 0.0,
+        "shape_error_by_key": dict(shape_error_by_key),
         "errors": dict(error_dict),
     }
