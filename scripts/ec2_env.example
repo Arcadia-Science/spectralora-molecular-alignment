@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Copy to ec2_env.sh and edit values.
+
+# Repo/venv
+REPO_DIR="$HOME/proteins-ml-copy"
+PYTHON_BIN="$HOME/miniforge3/envs/detanet/bin/python"
+
+# FSx for Lustre
+FSX_DNS="fs-xxxx.fsx.<region>.amazonaws.com"
+FSX_MOUNT_NAME="fsx"
+MOUNT_POINT="/mnt/fsx"
+
+# Data paths on FSx
+DATASETS_ROOT="$MOUNT_POINT/Datasets"
+OUTPUT_ROOT="$MOUNT_POINT/processed_all"
+CHECKPOINT_PATH="$MOUNT_POINT/checkpoints/DPA2-Drug-v1.pth"
+
+# Pipeline parallelism
+WORKERS=10
+OMP_THREADS=8
+MKL_THREADS=8
+OPENBLAS_THREADS=8
+TORCH_THREADS=8
+DP_INTRA_THREADS=8
+DP_INTER_THREADS=8
+SHARD_SIZE=256
+
+# Two-machine split (set JOB_INDEX=0 on first, 1 on second)
+JOB_INDEX=0
+JOB_COUNT=2
+
+# CloudWatch Logs
+AWS_REGION="us-east-1"
+CW_LOG_GROUP="/detanet/pipeline"
+CW_LOG_STREAM=""  # empty -> use instance-id
+
+# S3 sync
+S3_BUCKET="molecule-dft-imputed"
+S3_PREFIX="processed_all"
+SYNC_INTERVAL=900
