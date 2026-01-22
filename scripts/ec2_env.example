@@ -31,6 +31,7 @@ DP_INTER_THREADS=8
 SHARD_SIZE=256
 SAVE_DEVICE="cpu"
 NO_PSI4=1
+DP_BACKEND="pytorch"
 
 # Two-machine split (set JOB_INDEX=0 on first, 1 on second)
 JOB_INDEX=0

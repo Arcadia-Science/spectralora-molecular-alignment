@@ -16,6 +16,7 @@ export WORKERS OMP_THREADS MKL_THREADS OPENBLAS_THREADS TORCH_THREADS TORCH_INTE
 export DP_INTRA_THREADS DP_INTER_THREADS
 export SHARD_SIZE SAVE_DEVICE NO_PSI4
 export JOB_INDEX JOB_COUNT
+export DP_BACKEND="${DP_BACKEND:-pytorch}"
 
 export LOG_FILE="${LOG_FILE:-$OUTPUT_ROOT/run.log}"
 
@@ -71,7 +72,7 @@ echo "Launching pipeline:"
 printf '  %q' "${cmd[@]}"
 echo
 
-nohup env PYTHONUNBUFFERED=1 "${cmd[@]}" > "$LOG_FILE" 2>&1 &
+nohup env PYTHONUNBUFFERED=1 DP_BACKEND="$DP_BACKEND" "${cmd[@]}" > "$LOG_FILE" 2>&1 &
 echo $! > "$OUTPUT_ROOT/pipeline.pid"
 echo "PID: $(cat "$OUTPUT_ROOT/pipeline.pid")"
 echo "Log: $LOG_FILE"

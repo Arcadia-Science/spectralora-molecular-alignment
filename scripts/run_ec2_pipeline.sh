@@ -29,6 +29,7 @@ SAVE_DEVICE="${SAVE_DEVICE:-cpu}"
 NO_PSI4="${NO_PSI4:-1}"
 JOB_INDEX="${JOB_INDEX:-}"
 JOB_COUNT="${JOB_COUNT:-}"
+DP_BACKEND="${DP_BACKEND:-pytorch}"
 
 mkdir -p "$OUTPUT_ROOT"
 
@@ -76,7 +77,7 @@ echo "Launching pipeline:"
 printf '  %q' "${cmd[@]}"
 echo
 
-nohup env PYTHONUNBUFFERED=1 "${cmd[@]}" > "$LOG_FILE" 2>&1 &
+nohup env PYTHONUNBUFFERED=1 DP_BACKEND="$DP_BACKEND" "${cmd[@]}" > "$LOG_FILE" 2>&1 &
 echo $! > "$OUTPUT_ROOT/pipeline.pid"
 echo "PID: $(cat "$OUTPUT_ROOT/pipeline.pid")"
 echo "Log: $LOG_FILE"
