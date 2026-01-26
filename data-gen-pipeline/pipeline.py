@@ -785,9 +785,11 @@ def build_data_from_smiles(
             source_map.setdefault("npacharge", "charge_approx")
         else:
             source_map.setdefault("npacharge", "gasteiger")
-    if charges.numel() != z.shape[0]:
+    if charges is not None and charges.ndim > 1:
+        charges = charges.squeeze()
+    if charges is None or charges.ndim != 1 or charges.shape[0] != z.shape[0]:
         charges = approximate_charges_from_z(z).to(dtype=pos.dtype)
-        source_map.setdefault("npacharge", "charge_approx")
+        source_map["npacharge"] = "charge_approx"
     charges = charges.to(cfg.device, dtype=pos.dtype)
     masses = atomic_masses_from_z(z).to(cfg.device, dtype=pos.dtype)
 

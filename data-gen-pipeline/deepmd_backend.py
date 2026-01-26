@@ -283,8 +283,12 @@ class DeepMDPotBackend(DeepMDBase, ForceBackend):
         from deepmd.infer import DeepPot
 
         try:
+            if self.head:
+                return DeepPot(model_path, device=str(self.device), head=self.head)
             return DeepPot(model_path, device=str(self.device))
         except TypeError:
+            if self.head:
+                return DeepPot(model_path, head=self.head)
             return DeepPot(model_path)
 
     def _parse_eval(self, out, pos: torch.Tensor):

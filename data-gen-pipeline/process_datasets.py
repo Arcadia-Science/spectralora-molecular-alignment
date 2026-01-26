@@ -537,7 +537,8 @@ def _run_job_worker(job: DatasetJob, args, rank: int, world_size: int) -> None:
     if args.torch_threads is not None:
         torch.set_num_threads(args.torch_threads)
     if args.torch_interop_threads is not None:
-        torch.set_num_interop_threads(args.torch_interop_threads)
+        # DeepMD sets interop threads during import; avoid calling twice in workers.
+        os.environ["TORCH_NUM_INTEROP_THREADS"] = str(args.torch_interop_threads)
 
     cfg = apply_cfg_overrides(job.cfg, args)
     if world_size > 1:
