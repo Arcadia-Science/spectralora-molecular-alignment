@@ -73,6 +73,8 @@ def main() -> None:
     parser.add_argument("--mode", default="min", choices=["min", "max"])
     parser.add_argument("--local-dir", default="ray_results")
     parser.add_argument("--max-concurrent", type=int, default=None)
+    parser.add_argument("--cpus-per-trial", type=int, default=4)
+    parser.add_argument("--gpus-per-trial", type=int, default=1)
     parser.add_argument("--base-args", default=None, help="JSON list of args to pass to train script.")
     parser.add_argument("extra_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -122,8 +124,11 @@ def main() -> None:
         metrics["duration_sec"] = duration
         session.report(metrics)
 
+    resources = {"cpu": args.cpus_per_trial}
+    if args.gpus_per_trial:
+        resources["gpu"] = args.gpus_per_trial
     tuner = tune.Tuner(
-        tune.with_resources(trainable, {"cpu": 1}),
+        tune.with_resources(trainable, resources),
         param_space=tune_space,
         tune_config=tune.TuneConfig(
             num_samples=args.num_samples,
