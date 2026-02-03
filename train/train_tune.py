@@ -155,6 +155,7 @@ def main() -> None:
         import ray
         from ray import tune
         from ray.air import session
+        from ray.tune import RunConfig
         from ray.tune.schedulers import ASHAScheduler, HyperBandScheduler
     except Exception as exc:
         raise RuntimeError("ray[tune] is required for train_tune.py") from exc
@@ -201,7 +202,7 @@ def main() -> None:
             if elapsed - last_report >= args.report_interval:
                 metrics = _load_last_metrics(run_dir / "metrics.jsonl", args.metric)
                 if metrics:
-                    session.report(metrics)
+                    tune.report(metrics)
                 last_report = elapsed
 
         duration = time.time() - start
@@ -223,7 +224,7 @@ def main() -> None:
                         print(line)
                 except Exception:
                     pass
-        session.report(metrics)
+        tune.report(metrics)
         if log_fh:
             log_fh.flush()
             log_fh.close()
@@ -246,7 +247,7 @@ def main() -> None:
         )
 
     storage_path = os.path.abspath(args.local_dir)
-    run_config = ray.air.RunConfig(storage_path=storage_path)
+    run_config = RunConfig(storage_path=storage_path)
 
     tune_config_kwargs = dict(
         num_samples=args.num_samples,

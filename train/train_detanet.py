@@ -498,9 +498,9 @@ def _build_optimizer(args: argparse.Namespace, model: nn.Module) -> torch.optim.
 
     if args.optimizer == "pt_shampoo":
         try:
-            from pytorch_optimizer import Shampoo
+            from torch_optimizer import Shampoo
         except Exception as exc:
-            raise RuntimeError("pytorch-optimizer is not installed.") from exc
+            raise RuntimeError("pytorch-optimizer (torch_optimizer) is not installed.") from exc
         return Shampoo(
             model.parameters(),
             lr=args.lr,
@@ -803,6 +803,12 @@ def main() -> None:
         help="Skip batches that raise exceptions during forward/backward.",
     )
     parser.add_argument(
+        "--max-bad-batches",
+        type=int,
+        default=0,
+        help="Abort epoch once this many bad batches are skipped (0 disables).",
+    )
+    parser.add_argument(
         "--debug-zero-distances",
         action="store_true",
         help="Print count of zero-distance edges on the first batch of each epoch.",
@@ -1049,6 +1055,10 @@ def main() -> None:
         skipped_batches = 0
         data_iter = iter(loader)
         while True:
+            if args.max_bad_batches and skipped_batches >= args.max_bad_batches:
+                raise RuntimeError(
+                    f"Exceeded max bad batches ({args.max_bad_batches}) at epoch={epoch}."
+                )
             try:
                 batch = next(data_iter)
             except StopIteration:
