@@ -49,15 +49,27 @@ import ray
 print("Ray version:", ray.__version__)
 PY
 
-# Ensure pytorch-optimizer (torch_optimizer) is available.
+# Ensure pytorch_optimizer (torch_optimizer) is available.
 if ! "$PY" - <<'PY' 2>/dev/null
 import importlib.util
 raise SystemExit(0 if importlib.util.find_spec("torch_optimizer") else 1)
 PY
 then
-  echo ">> Installing pytorch-optimizer (required for pt_shampoo)"
-  "$PY" -m pip install --quiet pytorch-optimizer
+  echo ">> Installing pytorch_optimizer (required for pt_shampoo)"
+  "$PY" -m pip install --quiet pytorch_optimizer
+  if ! "$PY" - <<'PY' 2>/dev/null
+import importlib.util
+raise SystemExit(0 if importlib.util.find_spec("torch_optimizer") else 1)
+PY
+  then
+    echo ">> Fallback: installing pytorch-optimizer"
+    "$PY" -m pip install --quiet pytorch-optimizer
+  fi
 fi
+"$PY" - <<'PY'
+import torch_optimizer  # noqa: F401
+print("torch_optimizer OK")
+PY
 
 # Ensure PEFT (AdaLoRA) is available.
 if ! "$PY" - <<'PY' 2>/dev/null
@@ -68,6 +80,10 @@ then
   echo ">> Installing peft (required for AdaLoRA)"
   "$PY" -m pip install --quiet peft
 fi
+"$PY" - <<'PY'
+import peft  # noqa: F401
+print("peft OK")
+PY
 
 if [ -x "$RAY_CLI" ]; then
   "$RAY_CLI" stop || true
@@ -107,6 +123,7 @@ cat > /tmp/base_args.json <<'JSON'
   "--eval-every","1",
   "--amp",
   "--grad-clip","1.0",
+  "--ddp-find-unused-parameters",
   "--use-elora",
   "--use-adalora",
   "--adapter-freeze-base",
@@ -132,6 +149,14 @@ cat > /tmp/param_space.json <<'JSON'
 }
 JSON
 
+GPUS_PER_TRIAL="${GPUS_PER_TRIAL:-2}"
+MAX_CONCURRENT="${MAX_CONCURRENT:-4}"
+CPUS_PER_TRIAL="${CPUS_PER_TRIAL:-12}"
+
+export NCCL_ASYNC_ERROR_HANDLING="${NCCL_ASYNC_ERROR_HANDLING:-1}"
+export NCCL_BLOCKING_WAIT="${NCCL_BLOCKING_WAIT:-1}"
+export NCCL_TIMEOUT="${NCCL_TIMEOUT:-1800}"
+
 WANDB_MODE=offline WANDB_SILENT=true \
 "$PY" "$REPO/train/train_tune.py" \
   --registry-dir /fsx/model_registry \
@@ -139,9 +164,9 @@ WANDB_MODE=offline WANDB_SILENT=true \
   --param-space-file /tmp/param_space.json \
   --base-args "$(tr -d '\n' </tmp/base_args.json)" \
   --num-samples 8 \
-  --max-concurrent 4 \
-  --cpus-per-trial 8 \
-  --gpus-per-trial 2 \
+  --max-concurrent "$MAX_CONCURRENT" \
+  --cpus-per-trial "$CPUS_PER_TRIAL" \
+  --gpus-per-trial "$GPUS_PER_TRIAL" \
   --scheduler asha \
   --max-t 5 \
   --report-interval 60 \

@@ -1,7 +1,7 @@
-#!/usr/bin/env python3
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -11,7 +11,7 @@ import math
 import subprocess
 import time
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Any, Iterable, List, Optional
 
 import torch
 import torch.distributed as dist
@@ -366,6 +366,23 @@ def _has_nonfinite_grad(model: nn.Module) -> bool:
     return False
 
 
+def _batch_has_nonfinite(batch: Any) -> bool:
+    for attr in ("pos", "z", "edge_attr", "edge_weight"):
+        val = getattr(batch, attr, None)
+        if torch.is_tensor(val) and val.dtype.is_floating_point:
+            if not torch.isfinite(val).all().item():
+                return True
+    return False
+
+
+def _sync_skip(skip: bool, device: torch.device) -> bool:
+    if not dist.is_available() or not dist.is_initialized():
+        return skip
+    flag = torch.tensor(1 if skip else 0, device=device)
+    dist.all_reduce(flag, op=dist.ReduceOp.SUM)
+    return bool(flag.item())
+
+
 def _bootstrap_ci(
     values: torch.Tensor, samples: int, ci: float, seed: int
 ) -> tuple[float, float, float]:
@@ -406,6 +423,9 @@ def _evaluate(
     with torch.no_grad():
         for batch in loader:
             batch = batch.to(device)
+            if skip_nonfinite and _batch_has_nonfinite(batch):
+                skipped += 1
+                continue
             target = getattr(batch, task).float()
             mask = getattr(batch, mask_name, None)
             if mask is None or not use_impute_mask:
@@ -746,6 +766,12 @@ def main() -> None:
     parser.add_argument("--adalora-scalar-heads", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--adalora-attention", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--adapter-freeze-base", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--ddp-find-unused-parameters",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable DDP find_unused_parameters (auto-enabled for LoRA adapters).",
+    )
 
     parser.add_argument("--fsdp", action="store_true")
     parser.add_argument("--amp", action="store_true")
@@ -831,6 +857,9 @@ def main() -> None:
 
     rank, world_size, local_rank = init_distributed()
     torch.manual_seed(args.seed + rank)
+
+    if args.ddp_find_unused_parameters is None:
+        args.ddp_find_unused_parameters = bool(args.use_elora or args.use_adalora)
 
     args.device = torch.device("cuda", local_rank) if torch.cuda.is_available() else torch.device("cpu")
     if not args.use_elora:
@@ -1028,6 +1057,7 @@ def main() -> None:
         model = torch.nn.parallel.DistributedDataParallel(
             model,
             device_ids=[local_rank] if args.device.type == "cuda" else None,
+            find_unused_parameters=bool(args.ddp_find_unused_parameters),
         )
 
     optimizer = _build_optimizer(args, model)
@@ -1053,134 +1083,146 @@ def main() -> None:
         running = 0.0
         step = -1
         skipped_batches = 0
-        data_iter = iter(loader)
-        while True:
-            if args.max_bad_batches and skipped_batches >= args.max_bad_batches:
-                raise RuntimeError(
-                    f"Exceeded max bad batches ({args.max_bad_batches}) at epoch={epoch}."
-                )
-            try:
-                batch = next(data_iter)
-            except StopIteration:
-                break
-            except Exception:
-                if args.skip_bad_batches:
-                    skipped_batches += 1
-                    continue
-                raise
-            step += 1
-            batch = batch.to(args.device)
-            if step % args.grad_accum == 0:
-                optimizer.zero_grad(set_to_none=True)
-
-            try:
-                target = getattr(batch, args.task).float()
-                mask = getattr(batch, mask_name, None)
-                if mask is None or not args.use_impute_mask:
-                    mask = torch.ones_like(target)
-                else:
-                    mask = mask.float()
-
-                with torch.cuda.amp.autocast(enabled=amp_enabled):
-                    pred = model(z=batch.z, pos=batch.pos, edge_index=batch.edge_index, batch=batch.batch).float()
-
-                if args.debug_zero_distances and step == 0 and hasattr(batch, "edge_index"):
-                    i, j = batch.edge_index
-                    rij = batch.pos[j] - batch.pos[i]
-                    zero_edges = (torch.norm(rij, dim=-1) == 0).sum().item()
-                    if zero_edges:
-                        print(f"epoch={epoch} zero_distance_edges={zero_edges}")
-
-                if per_atom:
-                    counts = torch.bincount(batch.batch, minlength=target.shape[0]).float().to(args.device)
-                    while counts.dim() < target.dim():
-                        counts = counts.unsqueeze(-1)
-                    pred = pred / counts.clamp(min=1.0)
-                    target = target / counts.clamp(min=1.0)
-
-                if base_norm == "batch":
-                    denom = mask.sum().clamp(min=1.0)
-                    mean = (target * mask).sum() / denom
-                    var = ((target - mean) ** 2 * mask).sum() / denom
-                    std = torch.sqrt(var + 1e-12)
-                elif base_norm == "dataset":
-                    mean = norm_mean
-                    std = norm_std
-                else:
-                    mean = 0.0
-                    std = 1.0
-
-                pred = (pred - mean) / std
-                target = (target - mean) / std
-
-                if args.skip_nonfinite:
-                    if not torch.isfinite(pred).all().item():
+        join_cm = (
+            model.join()
+            if world_size > 1 and hasattr(model, "join")
+            else contextlib.nullcontext()
+        )
+        with join_cm:
+            data_iter = iter(loader)
+            while True:
+                if args.max_bad_batches and skipped_batches >= args.max_bad_batches:
+                    raise RuntimeError(
+                        f"Exceeded max bad batches ({args.max_bad_batches}) at epoch={epoch}."
+                    )
+                try:
+                    batch = next(data_iter)
+                except StopIteration:
+                    break
+                except Exception:
+                    if args.skip_bad_batches:
                         skipped_batches += 1
                         continue
-                    if not torch.isfinite(target).all().item():
-                        skipped_batches += 1
-                        continue
-                    if (
-                        torch.is_tensor(mask)
-                        and mask.dtype.is_floating_point
-                        and not torch.isfinite(mask).all().item()
-                    ):
-                        skipped_batches += 1
-                        continue
+                    raise
 
-                loss = ((pred - target) ** 2 * mask).sum() / mask.sum().clamp(min=1.0)
-                loss = loss / args.grad_accum
-                if args.skip_nonfinite and not torch.isfinite(loss).all().item():
-                    skipped_batches += 1
-                    continue
-
-                scaler.scale(loss).backward()
-                if (step + 1) % args.grad_accum == 0:
-                    if args.grad_clip and args.grad_clip > 0:
-                        if amp_enabled:
-                            scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                    if args.skip_nonfinite:
-                        if amp_enabled:
-                            scaler.unscale_(optimizer)
-                        if _has_nonfinite_grad(model):
-                            skipped_batches += 1
-                            optimizer.zero_grad(set_to_none=True)
-                            scaler.update()
-                            continue
-                    scaler.step(optimizer)
-                    scaler.update()
-            except Exception:
-                if args.skip_bad_batches:
-                    skipped_batches += 1
+                step += 1
+                batch = batch.to(args.device)
+                if step % args.grad_accum == 0:
                     optimizer.zero_grad(set_to_none=True)
-                    if amp_enabled:
-                        scaler.update()
-                    continue
-                raise
 
-            running += loss.item()
-            global_step += 1
-            if rank == 0 and (global_step % args.log_every == 0):
-                avg_loss = running / max(1, args.log_every)
-                lr = optimizer.param_groups[0]["lr"]
-                print(f"epoch={epoch} step={global_step} loss={avg_loss:.6f} lr={lr:.6e}")
-                _append_metrics(
-                    run_dir,
-                    {
-                        "epoch": epoch,
-                        "step": global_step,
-                        "split": "train",
-                        "loss": avg_loss,
-                        "lr": lr,
-                    },
-                )
-                if wandb_run:
-                    wandb_run.log({"train/loss": avg_loss, "lr": lr}, step=global_step)
-                if tb_writer:
-                    tb_writer.add_scalar("train/loss", avg_loss, global_step)
-                    tb_writer.add_scalar("train/lr", lr, global_step)
-                running = 0.0
+                try:
+                    if args.skip_nonfinite and _batch_has_nonfinite(batch):
+                        if _sync_skip(True, args.device):
+                            skipped_batches += 1
+                            continue
+
+                    target = getattr(batch, args.task).float()
+                    mask = getattr(batch, mask_name, None)
+                    if mask is None or not args.use_impute_mask:
+                        mask = torch.ones_like(target)
+                    else:
+                        mask = mask.float()
+
+                    with torch.cuda.amp.autocast(enabled=amp_enabled):
+                        pred = model(z=batch.z, pos=batch.pos, edge_index=batch.edge_index, batch=batch.batch).float()
+
+                    if args.debug_zero_distances and step == 0 and hasattr(batch, "edge_index"):
+                        i, j = batch.edge_index
+                        rij = batch.pos[j] - batch.pos[i]
+                        zero_edges = (torch.norm(rij, dim=-1) == 0).sum().item()
+                        if zero_edges:
+                            print(f"epoch={epoch} zero_distance_edges={zero_edges}")
+
+                    if per_atom:
+                        counts = torch.bincount(batch.batch, minlength=target.shape[0]).float().to(args.device)
+                        while counts.dim() < target.dim():
+                            counts = counts.unsqueeze(-1)
+                        pred = pred / counts.clamp(min=1.0)
+                        target = target / counts.clamp(min=1.0)
+
+                    if base_norm == "batch":
+                        denom = mask.sum().clamp(min=1.0)
+                        mean = (target * mask).sum() / denom
+                        var = ((target - mean) ** 2 * mask).sum() / denom
+                        std = torch.sqrt(var + 1e-12)
+                    elif base_norm == "dataset":
+                        mean = norm_mean
+                        std = norm_std
+                    else:
+                        mean = 0.0
+                        std = 1.0
+
+                    pred = (pred - mean) / std
+                    target = (target - mean) / std
+
+                    if args.skip_nonfinite:
+                        pred_bad = not torch.isfinite(pred).all().item()
+                        target_bad = not torch.isfinite(target).all().item()
+                        mask_bad = (
+                            torch.is_tensor(mask)
+                            and mask.dtype.is_floating_point
+                            and not torch.isfinite(mask).all().item()
+                        )
+                        if _sync_skip(pred_bad or target_bad or mask_bad, args.device):
+                            skipped_batches += 1
+                            continue
+
+                    loss = ((pred - target) ** 2 * mask).sum() / mask.sum().clamp(min=1.0)
+                    loss = loss / args.grad_accum
+                    if args.skip_nonfinite:
+                        loss_bad = not torch.isfinite(loss).all().item()
+                        if _sync_skip(loss_bad, args.device):
+                            skipped_batches += 1
+                            continue
+
+                    scaler.scale(loss).backward()
+                    if (step + 1) % args.grad_accum == 0:
+                        if args.grad_clip and args.grad_clip > 0:
+                            if amp_enabled:
+                                scaler.unscale_(optimizer)
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                        if args.skip_nonfinite:
+                            if amp_enabled:
+                                scaler.unscale_(optimizer)
+                            grad_bad = _has_nonfinite_grad(model)
+                            if _sync_skip(grad_bad, args.device):
+                                skipped_batches += 1
+                                optimizer.zero_grad(set_to_none=True)
+                                scaler.update()
+                                continue
+                        scaler.step(optimizer)
+                        scaler.update()
+                except Exception:
+                    if args.skip_bad_batches:
+                        skipped_batches += 1
+                        optimizer.zero_grad(set_to_none=True)
+                        if amp_enabled:
+                            scaler.update()
+                        continue
+                    raise
+
+                running += loss.item()
+                global_step += 1
+                if rank == 0 and (global_step % args.log_every == 0):
+                    avg_loss = running / max(1, args.log_every)
+                    lr = optimizer.param_groups[0]["lr"]
+                    print(f"epoch={epoch} step={global_step} loss={avg_loss:.6f} lr={lr:.6e}")
+                    _append_metrics(
+                        run_dir,
+                        {
+                            "epoch": epoch,
+                            "step": global_step,
+                            "split": "train",
+                            "loss": avg_loss,
+                            "lr": lr,
+                        },
+                    )
+                    if wandb_run:
+                        wandb_run.log({"train/loss": avg_loss, "lr": lr}, step=global_step)
+                    if tb_writer:
+                        tb_writer.add_scalar("train/loss", avg_loss, global_step)
+                        tb_writer.add_scalar("train/lr", lr, global_step)
+                    running = 0.0
 
         if step >= 0 and (step + 1) % args.grad_accum != 0:
             scaler.step(optimizer)
