@@ -10,6 +10,7 @@ import csv
 import math
 import subprocess
 import time
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Iterable, List, Optional
 
@@ -194,7 +195,7 @@ class ShardIterable(IterableDataset):
                 yield item
 
 
-def init_distributed() -> tuple[int, int, int]:
+def init_distributed(timeout_seconds: Optional[int] = None) -> tuple[int, int, int]:
     if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
         return 0, 1, 0
 
@@ -204,7 +205,18 @@ def init_distributed() -> tuple[int, int, int]:
 
     if not dist.is_initialized():
         backend = "nccl" if torch.cuda.is_available() else "gloo"
-        dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+        timeout = None
+        if timeout_seconds and timeout_seconds > 0:
+            timeout = timedelta(seconds=timeout_seconds)
+        if timeout is None:
+            dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+        else:
+            dist.init_process_group(
+                backend=backend,
+                rank=rank,
+                world_size=world_size,
+                timeout=timeout,
+            )
 
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
@@ -383,6 +395,14 @@ def _sync_skip(skip: bool, device: torch.device) -> bool:
     return bool(flag.item())
 
 
+def _sync_sum(value: int, device: torch.device) -> int:
+    if not dist.is_available() or not dist.is_initialized():
+        return value
+    count = torch.tensor(int(value), device=device)
+    dist.all_reduce(count, op=dist.ReduceOp.SUM)
+    return int(count.item())
+
+
 def _bootstrap_ci(
     values: torch.Tensor, samples: int, ci: float, seed: int
 ) -> tuple[float, float, float]:
@@ -415,16 +435,27 @@ def _evaluate(
     bootstrap_ci: float,
     seed: int,
     skip_nonfinite: bool,
+    log_samples: bool = False,
+    max_samples: int = 0,
 ) -> dict:
     model.eval()
     mse_vals = []
     mae_vals = []
     skipped = 0
+    skip_counts: dict[str, int] = {}
+    pred_samples = []
+    target_samples = []
+    raw_pred_samples = []
+    raw_target_samples = []
+    raw_pred_finite = []
+    raw_target_finite = []
     with torch.no_grad():
         for batch in loader:
             batch = batch.to(device)
             if skip_nonfinite and _batch_has_nonfinite(batch):
                 skipped += 1
+                if log_samples:
+                    skip_counts["batch_nonfinite"] = skip_counts.get("batch_nonfinite", 0) + 1
                 continue
             target = getattr(batch, task).float()
             mask = getattr(batch, mask_name, None)
@@ -436,11 +467,40 @@ def _evaluate(
             try:
                 with torch.cuda.amp.autocast(enabled=False):
                     pred = model(z=batch.z, pos=batch.pos, edge_index=batch.edge_index, batch=batch.batch).float()
-            except Exception:
-                if skip_nonfinite:
-                    skipped += 1
-                    continue
-                raise
+            except Exception as exc:
+                # Some implicit models require grads even in eval forward.
+                if "does not require grad" in str(exc):
+                    try:
+                        with torch.enable_grad():
+                            with torch.cuda.amp.autocast(enabled=False):
+                                pred = model(
+                                    z=batch.z,
+                                    pos=batch.pos,
+                                    edge_index=batch.edge_index,
+                                    batch=batch.batch,
+                                ).float()
+                    except Exception as exc2:
+                        if skip_nonfinite:
+                            skipped += 1
+                            if log_samples:
+                                skip_counts["pred_exception"] = skip_counts.get("pred_exception", 0) + 1
+                                msg = str(exc2)
+                                if msg:
+                                    skip_counts["pred_exception_msg"] = msg[:300]
+                            print(f"evaluate: pred_exception={exc2}")
+                            continue
+                        raise
+                else:
+                    if skip_nonfinite:
+                        skipped += 1
+                        if log_samples:
+                            skip_counts["pred_exception"] = skip_counts.get("pred_exception", 0) + 1
+                            msg = str(exc)
+                            if msg:
+                                skip_counts["pred_exception_msg"] = msg[:300]
+                        print(f"evaluate: pred_exception={exc}")
+                        continue
+                    raise
 
             if per_atom:
                 counts = torch.bincount(batch.batch, minlength=target.shape[0]).float().to(device)
@@ -448,6 +508,24 @@ def _evaluate(
                     counts = counts.unsqueeze(-1)
                 pred = pred / counts.clamp(min=1.0)
                 target = target / counts.clamp(min=1.0)
+
+            if log_samples and max_samples > 0 and len(pred_samples) < max_samples:
+                raw_flat_pred = pred.detach().view(-1).cpu().tolist()
+                raw_flat_target = target.detach().view(-1).cpu().tolist()
+                flat_pred = pred.detach().view(-1).cpu().tolist()
+                flat_target = target.detach().view(-1).cpu().tolist()
+                for p_val, t_val in zip(raw_flat_pred, raw_flat_target):
+                    raw_pred_samples.append(float(p_val))
+                    raw_target_samples.append(float(t_val))
+                    raw_pred_finite.append(bool(math.isfinite(float(p_val))))
+                    raw_target_finite.append(bool(math.isfinite(float(t_val))))
+                    if len(raw_pred_samples) >= max_samples:
+                        break
+                for p_val, t_val in zip(flat_pred, flat_target):
+                    pred_samples.append(float(p_val))
+                    target_samples.append(float(t_val))
+                    if len(pred_samples) >= max_samples:
+                        break
 
             if base_norm == "batch":
                 denom = mask.sum().clamp(min=1.0)
@@ -467,30 +545,61 @@ def _evaluate(
             if skip_nonfinite:
                 if not torch.isfinite(pred).all().item():
                     skipped += 1
+                    if log_samples:
+                        skip_counts["pred_nonfinite"] = skip_counts.get("pred_nonfinite", 0) + 1
                     continue
                 if not torch.isfinite(target).all().item():
                     skipped += 1
+                    if log_samples:
+                        skip_counts["target_nonfinite"] = skip_counts.get("target_nonfinite", 0) + 1
                     continue
                 if torch.is_tensor(mask) and mask.dtype.is_floating_point and not torch.isfinite(mask).all().item():
                     skipped += 1
+                    if log_samples:
+                        skip_counts["mask_nonfinite"] = skip_counts.get("mask_nonfinite", 0) + 1
                     continue
 
             err = (pred - target) ** 2
             abs_err = (pred - target).abs()
+
+            if skip_nonfinite:
+                if not torch.isfinite(err).all().item():
+                    skipped += 1
+                    if log_samples:
+                        skip_counts["err_nonfinite"] = skip_counts.get("err_nonfinite", 0) + 1
+                    continue
+                if not torch.isfinite(abs_err).all().item():
+                    skipped += 1
+                    if log_samples:
+                        skip_counts["abs_err_nonfinite"] = skip_counts.get("abs_err_nonfinite", 0) + 1
+                    continue
 
             mse_vals.append(_flatten_errors(err, mask))
             mae_vals.append(_flatten_errors(abs_err, mask))
 
     if not mse_vals:
         if skipped:
-            print(f"evaluate: skipped_batches={skipped}")
-        return {"mse": 0.0, "mse_lo": 0.0, "mse_hi": 0.0, "mae": 0.0, "mae_lo": 0.0, "mae_hi": 0.0}
+            if skip_counts:
+                print(f"evaluate: skipped_batches={skipped} skip_counts={skip_counts}")
+            else:
+                print(f"evaluate: skipped_batches={skipped}")
+        metrics = {"mse": 0.0, "mse_lo": 0.0, "mse_hi": 0.0, "mae": 0.0, "mae_lo": 0.0, "mae_hi": 0.0}
+        if log_samples and max_samples > 0:
+            metrics["pred_samples"] = pred_samples
+            metrics["target_samples"] = target_samples
+            metrics["raw_pred_samples"] = raw_pred_samples
+            metrics["raw_target_samples"] = raw_target_samples
+            metrics["raw_pred_finite"] = raw_pred_finite
+            metrics["raw_target_finite"] = raw_target_finite
+            if skip_counts:
+                metrics["skip_counts"] = skip_counts
+        return metrics
 
     mse = torch.cat(mse_vals)
     mae = torch.cat(mae_vals)
     mse_mean, mse_lo, mse_hi = _bootstrap_ci(mse, bootstrap_samples, bootstrap_ci, seed)
     mae_mean, mae_lo, mae_hi = _bootstrap_ci(mae, bootstrap_samples, bootstrap_ci, seed + 1)
-    return {
+    metrics = {
         "mse": mse_mean,
         "mse_lo": mse_lo,
         "mse_hi": mse_hi,
@@ -498,6 +607,16 @@ def _evaluate(
         "mae_lo": mae_lo,
         "mae_hi": mae_hi,
     }
+    if log_samples and max_samples > 0:
+        metrics["pred_samples"] = pred_samples
+        metrics["target_samples"] = target_samples
+        metrics["raw_pred_samples"] = raw_pred_samples
+        metrics["raw_target_samples"] = raw_target_samples
+        metrics["raw_pred_finite"] = raw_pred_finite
+        metrics["raw_target_finite"] = raw_target_finite
+        if skip_counts:
+            metrics["skip_counts"] = skip_counts
+    return metrics
 
 
 def _build_optimizer(args: argparse.Namespace, model: nn.Module) -> torch.optim.Optimizer:
@@ -517,11 +636,22 @@ def _build_optimizer(args: argparse.Namespace, model: nn.Module) -> torch.optim.
         )
 
     if args.optimizer == "pt_shampoo":
+        shampoo_cls = None
         try:
-            from torch_optimizer import Shampoo
-        except Exception as exc:
-            raise RuntimeError("pytorch-optimizer (torch_optimizer) is not installed.") from exc
-        return Shampoo(
+            from pytorch_optimizer import Shampoo as _Shampoo
+
+            shampoo_cls = _Shampoo
+        except Exception:
+            try:
+                from torch_optimizer import Shampoo as _Shampoo
+
+                shampoo_cls = _Shampoo
+            except Exception as exc:
+                raise RuntimeError(
+                    "pytorch-optimizer is not installed. Try `pip install pytorch-optimizer` "
+                    "or `pip install torch_optimizer`."
+                ) from exc
+        return shampoo_cls(
             model.parameters(),
             lr=args.lr,
             momentum=args.shampoo_momentum,
@@ -714,6 +844,24 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument(
+        "--loader-timeout",
+        type=int,
+        default=0,
+        help="DataLoader timeout in seconds (0 disables).",
+    )
+    parser.add_argument(
+        "--prefetch-factor",
+        type=int,
+        default=2,
+        help="DataLoader prefetch factor (only if num-workers > 0).",
+    )
+    parser.add_argument(
+        "--persistent-workers",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep DataLoader workers alive between epochs.",
+    )
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--grad-accum", type=int, default=1)
@@ -772,6 +920,12 @@ def main() -> None:
         default=None,
         help="Enable DDP find_unused_parameters (auto-enabled for LoRA adapters).",
     )
+    parser.add_argument(
+        "--ddp-timeout",
+        type=int,
+        default=1800,
+        help="Process group timeout in seconds (DDP init).",
+    )
 
     parser.add_argument("--fsdp", action="store_true")
     parser.add_argument("--amp", action="store_true")
@@ -829,6 +983,24 @@ def main() -> None:
         help="Skip batches that raise exceptions during forward/backward.",
     )
     parser.add_argument(
+        "--log-preds",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Log sample predictions/targets to metrics.jsonl during eval.",
+    )
+    parser.add_argument(
+        "--log-train-preds",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Log sample predictions/targets from the training loop.",
+    )
+    parser.add_argument(
+        "--log-preds-max",
+        type=int,
+        default=5,
+        help="Maximum number of prediction/target pairs to log per eval.",
+    )
+    parser.add_argument(
         "--max-bad-batches",
         type=int,
         default=0,
@@ -844,6 +1016,12 @@ def main() -> None:
     parser.add_argument("--split-seed", type=int, default=123)
     parser.add_argument("--split-train", type=float, default=0.8)
     parser.add_argument("--split-val", type=float, default=0.1)
+    parser.add_argument(
+        "--train-use-distributed",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Shard training data across distributed ranks.",
+    )
 
     args = parser.parse_args()
     if not 0.0 <= args.split_train <= 1.0 or not 0.0 <= args.split_val <= 1.0:
@@ -855,11 +1033,15 @@ def main() -> None:
     if args.bootstrap_samples < 1:
         raise ValueError("--bootstrap-samples must be >= 1.")
 
-    rank, world_size, local_rank = init_distributed()
+    rank, world_size, local_rank = init_distributed(args.ddp_timeout)
     torch.manual_seed(args.seed + rank)
 
     if args.ddp_find_unused_parameters is None:
-        args.ddp_find_unused_parameters = bool(args.use_elora or args.use_adalora)
+        # Default to True for DDP to avoid hangs when some params are unused
+        # (e.g., adapters or conditional branches).
+        args.ddp_find_unused_parameters = world_size > 1
+        if args.use_elora or args.use_adalora:
+            args.ddp_find_unused_parameters = True
 
     args.device = torch.device("cuda", local_rank) if torch.cuda.is_available() else torch.device("cpu")
     if not args.use_elora:
@@ -897,15 +1079,25 @@ def main() -> None:
         split_seed=args.split_seed,
         split_train=args.split_train,
         split_val=args.split_val,
+        use_distributed=bool(args.train_use_distributed),
         skip_nonfinite=args.skip_nonfinite,
     )
     exclude_keys = [k.strip() for k in args.exclude_keys.split(",") if k.strip()]
+    loader_kwargs: dict[str, Any] = {}
+    if args.num_workers > 0:
+        loader_kwargs["persistent_workers"] = bool(args.persistent_workers)
+        if args.prefetch_factor and args.prefetch_factor > 0:
+            loader_kwargs["prefetch_factor"] = args.prefetch_factor
+        if args.loader_timeout and args.loader_timeout > 0:
+            loader_kwargs["timeout"] = args.loader_timeout
+
     loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
         exclude_keys=exclude_keys,
+        **loader_kwargs,
     )
     if args.split == "all" and rank == 0:
         print("warning: --split=all uses all data for training; val/test will overlap if evaluated.")
@@ -951,6 +1143,7 @@ def main() -> None:
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
         exclude_keys=exclude_keys,
+        **loader_kwargs,
     )
     test_loader = DataLoader(
         test_dataset,
@@ -958,6 +1151,7 @@ def main() -> None:
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
         exclude_keys=exclude_keys,
+        **loader_kwargs,
     )
 
     # Normalization stats
@@ -972,29 +1166,57 @@ def main() -> None:
 
     if base_norm == "dataset":
         cache_path = Path(args.norm_cache) if args.norm_cache else None
-        if cache_path and cache_path.exists():
-            stats = json.loads(cache_path.read_text())
-            norm_mean = torch.tensor(stats["mean"], device=args.device)
-            norm_std = torch.tensor(stats["std"], device=args.device)
-        else:
-            stats_loader = DataLoader(
-                train_dataset,
-                batch_size=args.batch_size,
-                num_workers=args.num_workers,
-                pin_memory=torch.cuda.is_available(),
-                exclude_keys=exclude_keys,
-            )
-            norm_mean, norm_std = _compute_stats(
-                stats_loader,
-                args.task,
-                mask_name,
-                per_atom=per_atom,
-                device=args.device,
-                skip_nonfinite=args.skip_nonfinite,
-            )
-            if rank == 0 and cache_path:
-                cache_path.parent.mkdir(parents=True, exist_ok=True)
-                cache_path.write_text(json.dumps({"mean": norm_mean.item(), "std": norm_std.item()}))
+        if rank == 0:
+            if cache_path and cache_path.exists():
+                stats = json.loads(cache_path.read_text())
+                norm_mean = torch.tensor(stats["mean"], device=args.device)
+                norm_std = torch.tensor(stats["std"], device=args.device)
+            else:
+                stats_dataset = ShardIterable(
+                    shard_paths,
+                    task=args.task,
+                    mask_mode=args.mask_mode,
+                    mask_key=args.mask_key,
+                    confidence_key=args.confidence_key,
+                    seed=args.seed,
+                    shuffle_shards=False,
+                    shuffle_samples=False,
+                    split=args.split,
+                    split_key=args.split_key,
+                    split_seed=args.split_seed,
+                    split_train=args.split_train,
+                    split_val=args.split_val,
+                    use_distributed=False,
+                    skip_nonfinite=args.skip_nonfinite,
+                )
+                stats_loader = DataLoader(
+                    stats_dataset,
+                    batch_size=args.batch_size,
+                    num_workers=0,
+                    pin_memory=torch.cuda.is_available(),
+                    exclude_keys=exclude_keys,
+                )
+                norm_mean, norm_std = _compute_stats(
+                    stats_loader,
+                    args.task,
+                    mask_name,
+                    per_atom=per_atom,
+                    device=args.device,
+                    skip_nonfinite=args.skip_nonfinite,
+                )
+                if cache_path:
+                    cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    cache_path.write_text(
+                        json.dumps({"mean": norm_mean.item(), "std": norm_std.item()})
+                    )
+
+        if dist.is_available() and dist.is_initialized():
+            if rank != 0:
+                norm_mean = torch.tensor(0.0, device=args.device)
+                norm_std = torch.tensor(1.0, device=args.device)
+            stats_tensor = torch.stack([norm_mean, norm_std])
+            dist.broadcast(stats_tensor, 0)
+            norm_mean, norm_std = stats_tensor[0], stats_tensor[1]
 
     model = build_model(args).to(args.device)
     if args.checkpoint:
@@ -1083,39 +1305,49 @@ def main() -> None:
         running = 0.0
         step = -1
         skipped_batches = 0
-        join_cm = (
-            model.join()
-            if world_size > 1 and hasattr(model, "join")
-            else contextlib.nullcontext()
-        )
-        with join_cm:
-            data_iter = iter(loader)
-            while True:
-                if args.max_bad_batches and skipped_batches >= args.max_bad_batches:
-                    raise RuntimeError(
-                        f"Exceeded max bad batches ({args.max_bad_batches}) at epoch={epoch}."
-                    )
-                try:
-                    batch = next(data_iter)
-                except StopIteration:
-                    break
-                except Exception:
-                    if args.skip_bad_batches:
-                        skipped_batches += 1
-                        continue
+        data_iter = iter(loader)
+        while True:
+            if args.max_bad_batches and skipped_batches >= args.max_bad_batches:
+                raise RuntimeError(
+                    f"Exceeded max bad batches ({args.max_bad_batches}) at epoch={epoch}."
+                )
+            fetch_failed = False
+            end_of_iter = False
+            batch = None
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                end_of_iter = True
+            except Exception:
+                fetch_failed = True
+                if not args.skip_bad_batches:
                     raise
 
-                step += 1
+            if dist.is_available() and dist.is_initialized():
+                total_has = _sync_sum(0 if end_of_iter else 1, args.device)
+                if total_has < world_size:
+                    break
+            else:
+                if end_of_iter:
+                    break
+
+            step += 1
+            skip_step = fetch_failed
+            if not skip_step and args.skip_nonfinite and _batch_has_nonfinite(batch):
+                skip_step = True
+            if dist.is_available() and dist.is_initialized():
+                if _sync_skip(skip_step, args.device):
+                    skipped_batches += 1
+                    continue
+            elif skip_step:
+                skipped_batches += 1
+                continue
+
                 batch = batch.to(args.device)
                 if step % args.grad_accum == 0:
                     optimizer.zero_grad(set_to_none=True)
 
                 try:
-                    if args.skip_nonfinite and _batch_has_nonfinite(batch):
-                        if _sync_skip(True, args.device):
-                            skipped_batches += 1
-                            continue
-
                     target = getattr(batch, args.task).float()
                     mask = getattr(batch, mask_name, None)
                     if mask is None or not args.use_impute_mask:
@@ -1139,6 +1371,9 @@ def main() -> None:
                             counts = counts.unsqueeze(-1)
                         pred = pred / counts.clamp(min=1.0)
                         target = target / counts.clamp(min=1.0)
+
+                    raw_pred = pred.detach()
+                    raw_target = target.detach()
 
                     if base_norm == "batch":
                         denom = mask.sum().clamp(min=1.0)
@@ -1194,11 +1429,12 @@ def main() -> None:
                         scaler.update()
                 except Exception:
                     if args.skip_bad_batches:
-                        skipped_batches += 1
-                        optimizer.zero_grad(set_to_none=True)
-                        if amp_enabled:
-                            scaler.update()
-                        continue
+                        if _sync_skip(True, args.device):
+                            skipped_batches += 1
+                            optimizer.zero_grad(set_to_none=True)
+                            if amp_enabled:
+                                scaler.update()
+                            continue
                     raise
 
                 running += loss.item()
@@ -1207,16 +1443,25 @@ def main() -> None:
                     avg_loss = running / max(1, args.log_every)
                     lr = optimizer.param_groups[0]["lr"]
                     print(f"epoch={epoch} step={global_step} loss={avg_loss:.6f} lr={lr:.6e}")
-                    _append_metrics(
-                        run_dir,
-                        {
-                            "epoch": epoch,
-                            "step": global_step,
-                            "split": "train",
-                            "loss": avg_loss,
-                            "lr": lr,
-                        },
-                    )
+                    metrics_row = {
+                        "epoch": epoch,
+                        "step": global_step,
+                        "split": "train",
+                        "loss": avg_loss,
+                        "lr": lr,
+                    }
+                    if args.log_train_preds:
+                        max_samples = max(0, int(args.log_preds_max))
+                        if max_samples > 0:
+                            flat_pred = pred.detach().view(-1).cpu().tolist()[:max_samples]
+                            flat_target = target.detach().view(-1).cpu().tolist()[:max_samples]
+                            flat_raw_pred = raw_pred.detach().view(-1).cpu().tolist()[:max_samples]
+                            flat_raw_target = raw_target.detach().view(-1).cpu().tolist()[:max_samples]
+                            metrics_row["train_pred_samples"] = flat_pred
+                            metrics_row["train_target_samples"] = flat_target
+                            metrics_row["train_raw_pred_samples"] = flat_raw_pred
+                            metrics_row["train_raw_target_samples"] = flat_raw_target
+                    _append_metrics(run_dir, metrics_row)
                     if wandb_run:
                         wandb_run.log({"train/loss": avg_loss, "lr": lr}, step=global_step)
                     if tb_writer:
@@ -1242,62 +1487,110 @@ def main() -> None:
                 save_state(model, optimizer, scheduler, scaler, state_path, args.fsdp, extra=extra)
             print(f"saved {save_path}")
 
-        if rank == 0 and ((epoch + 1) % args.eval_every == 0 or epoch == args.epochs - 1):
-            val_metrics = _evaluate(
-                model,
-                val_loader,
-                args.task,
-                mask_name,
-                args.device,
-                base_norm,
-                per_atom,
-                norm_mean,
-                norm_std,
-                args.use_impute_mask,
-                args.bootstrap_samples,
-                args.bootstrap_ci,
-                args.seed + epoch,
-                args.skip_nonfinite,
-            )
-            test_metrics = _evaluate(
-                model,
-                test_loader,
-                args.task,
-                mask_name,
-                args.device,
-                base_norm,
-                per_atom,
-                norm_mean,
-                norm_std,
-                args.use_impute_mask,
-                args.bootstrap_samples,
-                args.bootstrap_ci,
-                args.seed + epoch + 10,
-                args.skip_nonfinite,
-            )
-            metrics = {
-                "epoch": epoch,
-                "step": global_step,
-                "val_mse": val_metrics["mse"],
-                "val_mse_lo": val_metrics["mse_lo"],
-                "val_mse_hi": val_metrics["mse_hi"],
-                "val_mae": val_metrics["mae"],
-                "val_mae_lo": val_metrics["mae_lo"],
-                "val_mae_hi": val_metrics["mae_hi"],
-                "test_mse": test_metrics["mse"],
-                "test_mse_lo": test_metrics["mse_lo"],
-                "test_mse_hi": test_metrics["mse_hi"],
-                "test_mae": test_metrics["mae"],
-                "test_mae_lo": test_metrics["mae_lo"],
-                "test_mae_hi": test_metrics["mae_hi"],
-            }
-            _append_metrics(run_dir, metrics)
-            if wandb_run:
-                wandb_run.log(metrics, step=global_step)
-            if tb_writer:
-                for key, value in metrics.items():
-                    if isinstance(value, (int, float)):
-                        tb_writer.add_scalar(key, value, global_step)
+        if (epoch + 1) % args.eval_every == 0 or epoch == args.epochs - 1:
+            if world_size > 1 and dist.is_available() and dist.is_initialized():
+                dist.barrier()
+            if rank == 0:
+                eval_model = model.module if hasattr(model, "module") else model
+                val_metrics = _evaluate(
+                    eval_model,
+                    val_loader,
+                    args.task,
+                    mask_name,
+                    args.device,
+                    base_norm,
+                    per_atom,
+                    norm_mean,
+                    norm_std,
+                    args.use_impute_mask,
+                    args.bootstrap_samples,
+                    args.bootstrap_ci,
+                    args.seed + epoch,
+                    args.skip_nonfinite,
+                    args.log_preds,
+                    args.log_preds_max,
+                )
+                test_metrics = _evaluate(
+                    eval_model,
+                    test_loader,
+                    args.task,
+                    mask_name,
+                    args.device,
+                    base_norm,
+                    per_atom,
+                    norm_mean,
+                    norm_std,
+                    args.use_impute_mask,
+                    args.bootstrap_samples,
+                    args.bootstrap_ci,
+                    args.seed + epoch + 10,
+                    args.skip_nonfinite,
+                    args.log_preds,
+                    args.log_preds_max,
+                )
+            if world_size > 1 and dist.is_available() and dist.is_initialized():
+                dist.barrier()
+            if rank == 0:
+                metrics = {
+                    "epoch": epoch,
+                    "step": global_step,
+                    "val_mse": val_metrics["mse"],
+                    "val_mse_lo": val_metrics["mse_lo"],
+                    "val_mse_hi": val_metrics["mse_hi"],
+                    "val_mae": val_metrics["mae"],
+                    "val_mae_lo": val_metrics["mae_lo"],
+                    "val_mae_hi": val_metrics["mae_hi"],
+                    "test_mse": test_metrics["mse"],
+                    "test_mse_lo": test_metrics["mse_lo"],
+                    "test_mse_hi": test_metrics["mse_hi"],
+                    "test_mae": test_metrics["mae"],
+                    "test_mae_lo": test_metrics["mae_lo"],
+                    "test_mae_hi": test_metrics["mae_hi"],
+                }
+                if args.log_preds:
+                    val_pred_samples = val_metrics.get("pred_samples", [])
+                    val_target_samples = val_metrics.get("target_samples", [])
+                    test_pred_samples = test_metrics.get("pred_samples", [])
+                    test_target_samples = test_metrics.get("target_samples", [])
+                    val_raw_pred_samples = val_metrics.get("raw_pred_samples", [])
+                    val_raw_target_samples = val_metrics.get("raw_target_samples", [])
+                    val_raw_pred_finite = val_metrics.get("raw_pred_finite", [])
+                    val_raw_target_finite = val_metrics.get("raw_target_finite", [])
+                    val_skip_counts = val_metrics.get("skip_counts", {})
+                    test_raw_pred_samples = test_metrics.get("raw_pred_samples", [])
+                    test_raw_target_samples = test_metrics.get("raw_target_samples", [])
+                    test_raw_pred_finite = test_metrics.get("raw_pred_finite", [])
+                    test_raw_target_finite = test_metrics.get("raw_target_finite", [])
+                    test_skip_counts = test_metrics.get("skip_counts", {})
+                    metrics["val_pred_samples"] = val_pred_samples
+                    metrics["val_target_samples"] = val_target_samples
+                    metrics["test_pred_samples"] = test_pred_samples
+                    metrics["test_target_samples"] = test_target_samples
+                    metrics["val_raw_pred_samples"] = val_raw_pred_samples
+                    metrics["val_raw_target_samples"] = val_raw_target_samples
+                    metrics["val_raw_pred_finite"] = val_raw_pred_finite
+                    metrics["val_raw_target_finite"] = val_raw_target_finite
+                    if val_skip_counts:
+                        metrics["val_skip_counts"] = val_skip_counts
+                    metrics["test_raw_pred_samples"] = test_raw_pred_samples
+                    metrics["test_raw_target_samples"] = test_raw_target_samples
+                    metrics["test_raw_pred_finite"] = test_raw_pred_finite
+                    metrics["test_raw_target_finite"] = test_raw_target_finite
+                    if test_skip_counts:
+                        metrics["test_skip_counts"] = test_skip_counts
+                    if val_pred_samples or val_target_samples:
+                        val_pairs = list(zip(val_pred_samples, val_target_samples))
+                        print(f"val_pred_target_samples={val_pairs}")
+                    if test_pred_samples or test_target_samples:
+                        test_pairs = list(zip(test_pred_samples, test_target_samples))
+                        print(f"test_pred_target_samples={test_pairs}")
+                _append_metrics(run_dir, metrics)
+                if wandb_run:
+                    wandb_run.log(metrics, step=global_step)
+                if tb_writer:
+                    for key, value in metrics.items():
+                        if isinstance(value, (int, float)):
+                            tb_writer.add_scalar(key, value, global_step)
 
     if wandb_run:
         wandb_run.finish()
