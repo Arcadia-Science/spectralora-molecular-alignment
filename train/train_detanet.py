@@ -408,9 +408,23 @@ def _bootstrap_ci(
 ) -> tuple[float, float, float]:
     if values.numel() == 0:
         return 0.0, 0.0, 0.0
+    values = values.detach()
+    if values.is_cuda:
+        values = values.cpu()
     rng = torch.Generator(device=values.device)
     rng.manual_seed(seed)
     n = values.numel()
+    if samples <= 1 or n <= 1:
+        mean = values.mean().item()
+        return mean, mean, mean
+    max_n = int(os.environ.get("BOOTSTRAP_MAX_N", "20000"))
+    if n > max_n:
+        idx_subset = torch.randperm(n, generator=rng)[:max_n]
+        values = values[idx_subset]
+        n = values.numel()
+    max_elems = int(os.environ.get("BOOTSTRAP_MAX_ELEMS", "4000000"))
+    if samples * n > max_elems:
+        samples = max(1, max_elems // max(n, 1))
     idx = torch.randint(0, n, (samples, n), generator=rng, device=values.device)
     means = values[idx].mean(dim=1)
     mean = values.mean().item()
