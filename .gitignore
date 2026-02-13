@@ -226,3 +226,6 @@ commands.md
 commands.md
 ./commands.md
 *.commands.md
+.commands.md
+scripts/ec2_env.example
+scripts/mount_fsx.sh
