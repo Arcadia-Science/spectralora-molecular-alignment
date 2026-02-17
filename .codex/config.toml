@@ -1,0 +1,6 @@
+[mcp_servers.modal-aws-docs]
+command = "/Users/rahul/miniconda3/bin/docs-rag-mcp"
+args = ["serve"]
+startup_timeout_sec = 120
+env = { DATABASE_URL = "postgresql://localhost:5432/docs_rag", EMBEDDING_PROVIDER = "sentence_transformers", EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2", EMBEDDING_DIMENSIONS
+= "384" }
