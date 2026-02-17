@@ -13,7 +13,7 @@ import subprocess
 import time
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 import torch
 import torch.distributed as dist
@@ -87,6 +87,136 @@ def _normalize_split_key(value) -> str:
     return str(value)
 
 
+_RDKIT_CACHE: Optional[tuple[Any, Any]] = None
+
+
+def _ensure_rdkit_available() -> tuple[Any, Any]:
+    global _RDKIT_CACHE
+    if _RDKIT_CACHE is not None:
+        return _RDKIT_CACHE
+    try:
+        from rdkit import Chem
+        from rdkit import RDLogger
+        from rdkit.Chem.Scaffolds import MurckoScaffold
+    except Exception as exc:
+        raise RuntimeError(
+            "Scaffold split requires RDKit. Install with `pip install rdkit` "
+            "or use --split-method hash."
+        ) from exc
+    RDLogger.DisableLog("rdApp.error")
+    _RDKIT_CACHE = (Chem, MurckoScaffold)
+    return _RDKIT_CACHE
+
+
+def _resolve_molecule_key(item, group_key: str = "mol_key") -> Optional[str]:
+    key_val = getattr(item, group_key, None)
+    if key_val is None and group_key != "mol_key":
+        key_val = getattr(item, "mol_key", None)
+    if key_val is None and group_key != "number":
+        key_val = getattr(item, "number", None)
+    if key_val is None:
+        return None
+    return _normalize_split_key(key_val)
+
+
+def _resolve_smiles_string(item, smiles_key: str = "smile") -> Optional[str]:
+    keys = [smiles_key]
+    for fallback in ("smile", "smiles", "canonical_smiles"):
+        if fallback not in keys:
+            keys.append(fallback)
+    for key in keys:
+        value = getattr(item, key, None)
+        if value is None:
+            continue
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", errors="ignore")
+        if isinstance(value, str):
+            value = value.strip()
+            # Fast filter: avoid parsing obvious non-SMILES identifiers such as "12345".
+            if value and any(ch.isalpha() for ch in value):
+                return value
+    return None
+
+
+def _canonicalize_and_scaffold_smiles(
+    smiles: str,
+    *,
+    include_chirality: bool = False,
+) -> tuple[Optional[str], Optional[str]]:
+    Chem, MurckoScaffold = _ensure_rdkit_available()
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None, None
+
+    # Ignore atom mapping in canonical/scaffold grouping.
+    for atom in mol.GetAtoms():
+        if atom.GetAtomMapNum():
+            atom.SetAtomMapNum(0)
+
+    canonical = Chem.MolToSmiles(mol, canonical=True, isomericSmiles=include_chirality)
+    scaffold = MurckoScaffold.MurckoScaffoldSmiles(mol=mol, includeChirality=include_chirality)
+    if scaffold:
+        scaf_mol = Chem.MolFromSmiles(scaffold)
+        if scaf_mol is not None:
+            scaffold = Chem.MolToSmiles(scaf_mol, canonical=True, isomericSmiles=include_chirality)
+    return canonical, scaffold
+
+
+def _resolve_split_token(
+    item,
+    *,
+    split_method: str,
+    split_key: str,
+    scaffold_group_key: str,
+    scaffold_smiles_key: str,
+    scaffold_include_chirality: bool,
+    scaffold_fallback: str,
+    split_cache: Optional[Dict[str, str]] = None,
+) -> Optional[str]:
+    split_method = split_method.lower()
+    if split_method == "hash":
+        key_val = getattr(item, split_key, None)
+        if key_val is None and split_key != "number":
+            key_val = getattr(item, "number", None)
+        if key_val is None:
+            return None
+        return _normalize_split_key(key_val)
+
+    if split_method != "scaffold":
+        raise ValueError(f"unknown split method: {split_method}")
+
+    molecule_key = _resolve_molecule_key(item, scaffold_group_key)
+    if molecule_key is not None and split_cache is not None:
+        cached = split_cache.get(molecule_key)
+        if cached is not None:
+            return cached
+
+    smiles = _resolve_smiles_string(item, scaffold_smiles_key)
+    if smiles is None:
+        if molecule_key is None:
+            return None
+        token = f"MOLECULE::{molecule_key}"
+        if split_cache is not None:
+            split_cache[molecule_key] = token
+        return token
+
+    canonical_smiles, scaffold = _canonicalize_and_scaffold_smiles(
+        smiles,
+        include_chirality=scaffold_include_chirality,
+    )
+    if scaffold:
+        token = f"SCAFFOLD::{scaffold}"
+    elif scaffold_fallback == "molecule":
+        fallback = canonical_smiles or molecule_key or smiles
+        token = f"MOLECULE::{fallback}"
+    else:
+        token = "SCAFFOLD::__EMPTY__"
+
+    if molecule_key is not None and split_cache is not None:
+        split_cache[molecule_key] = token
+    return token
+
+
 class ShardIterable(IterableDataset):
     def __init__(
         self,
@@ -102,6 +232,11 @@ class ShardIterable(IterableDataset):
         shuffle_samples: bool = False,
         split: str = "all",
         split_key: str = "mol_key",
+        split_method: str = "hash",
+        scaffold_group_key: str = "mol_key",
+        scaffold_smiles_key: str = "smile",
+        scaffold_include_chirality: bool = False,
+        scaffold_fallback: str = "molecule",
         split_seed: int = 123,
         split_train: float = 0.8,
         split_val: float = 0.1,
@@ -127,6 +262,11 @@ class ShardIterable(IterableDataset):
         self.epoch = 0
         self.split = split
         self.split_key = split_key
+        self.split_method = split_method
+        self.scaffold_group_key = scaffold_group_key
+        self.scaffold_smiles_key = scaffold_smiles_key
+        self.scaffold_include_chirality = scaffold_include_chirality
+        self.scaffold_fallback = scaffold_fallback
         self.split_seed = split_seed
         self.split_train = split_train
         self.split_val = split_val
@@ -137,6 +277,7 @@ class ShardIterable(IterableDataset):
         self.single_first = single_first
         self.single_repeat = single_repeat
         self.force_all_splits = force_all_splits
+        self._split_cache: Dict[str, str] = {}
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = epoch
@@ -156,12 +297,18 @@ class ShardIterable(IterableDataset):
     def _passes_split(self, item) -> bool:
         if self.force_all_splits or self.split == "all":
             return True
-        key_val = getattr(item, self.split_key, None)
-        if key_val is None and self.split_key != "number":
-            key_val = getattr(item, "number", None)
-        if key_val is None:
+        key = _resolve_split_token(
+            item,
+            split_method=self.split_method,
+            split_key=self.split_key,
+            scaffold_group_key=self.scaffold_group_key,
+            scaffold_smiles_key=self.scaffold_smiles_key,
+            scaffold_include_chirality=self.scaffold_include_chirality,
+            scaffold_fallback=self.scaffold_fallback,
+            split_cache=self._split_cache,
+        )
+        if key is None:
             return False
-        key = _normalize_split_key(key_val)
         return _split_label(key, self.split_seed, self.split_train, self.split_val) == self.split
 
     def _is_valid_item(self, item) -> bool:
@@ -474,9 +621,14 @@ def _prepare_run_dir(save_dir: Path, args: argparse.Namespace, rank: int) -> Pat
         split_cfg = {
             "split": args.split,
             "split_key": args.split_key,
+            "split_method": args.split_method,
             "split_seed": args.split_seed,
             "split_train": args.split_train,
             "split_val": args.split_val,
+            "scaffold_group_key": args.scaffold_group_key,
+            "scaffold_smiles_key": args.scaffold_smiles_key,
+            "scaffold_include_chirality": args.scaffold_include_chirality,
+            "scaffold_fallback": args.scaffold_fallback,
         }
         (run_dir / "split_config.json").write_text(json.dumps(split_cfg, indent=2, sort_keys=True))
     return run_dir
@@ -1244,6 +1396,34 @@ def main() -> None:
     )
     parser.add_argument("--split", default="all", choices=["all", "train", "val", "test"])
     parser.add_argument("--split-key", default="mol_key")
+    parser.add_argument(
+        "--split-method",
+        default="hash",
+        choices=["hash", "scaffold"],
+        help="Split token method: hash key-based split or scaffold split (Murcko scaffold).",
+    )
+    parser.add_argument(
+        "--scaffold-group-key",
+        default="mol_key",
+        help="Molecule identifier key used to keep all conformers of one molecule in the same split.",
+    )
+    parser.add_argument(
+        "--scaffold-smiles-key",
+        default="smile",
+        help="SMILES key used for scaffold extraction when --split-method=scaffold.",
+    )
+    parser.add_argument(
+        "--scaffold-include-chirality",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include chirality in scaffold canonicalization.",
+    )
+    parser.add_argument(
+        "--scaffold-fallback",
+        default="molecule",
+        choices=["molecule", "global"],
+        help="Fallback when scaffold cannot be extracted: per-molecule token or global empty token.",
+    )
     parser.add_argument("--split-seed", type=int, default=123)
     parser.add_argument("--split-train", type=float, default=0.8)
     parser.add_argument("--split-val", type=float, default=0.1)
@@ -1283,10 +1463,14 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+    args.split_method = args.split_method.lower()
+    args.scaffold_fallback = args.scaffold_fallback.lower()
     if not 0.0 <= args.split_train <= 1.0 or not 0.0 <= args.split_val <= 1.0:
         raise ValueError("--split-train and --split-val must be in [0,1].")
     if args.split_train + args.split_val >= 1.0:
         raise ValueError("--split-train + --split-val must be < 1.0.")
+    if args.split_method == "scaffold":
+        _ensure_rdkit_available()
     if args.eval_every < 1:
         raise ValueError("--eval-every must be >= 1.")
     if args.eval_every_steps < 0:
@@ -1343,6 +1527,11 @@ def main() -> None:
         shuffle_samples=False,
         split=args.split,
         split_key=args.split_key,
+        split_method=args.split_method,
+        scaffold_group_key=args.scaffold_group_key,
+        scaffold_smiles_key=args.scaffold_smiles_key,
+        scaffold_include_chirality=args.scaffold_include_chirality,
+        scaffold_fallback=args.scaffold_fallback,
         split_seed=args.split_seed,
         split_train=args.split_train,
         split_val=args.split_val,
@@ -1387,6 +1576,11 @@ def main() -> None:
         shuffle_samples=False,
         split="val",
         split_key=args.split_key,
+        split_method=args.split_method,
+        scaffold_group_key=args.scaffold_group_key,
+        scaffold_smiles_key=args.scaffold_smiles_key,
+        scaffold_include_chirality=args.scaffold_include_chirality,
+        scaffold_fallback=args.scaffold_fallback,
         split_seed=args.split_seed,
         split_train=args.split_train,
         split_val=args.split_val,
@@ -1411,6 +1605,11 @@ def main() -> None:
         shuffle_samples=False,
         split="test",
         split_key=args.split_key,
+        split_method=args.split_method,
+        scaffold_group_key=args.scaffold_group_key,
+        scaffold_smiles_key=args.scaffold_smiles_key,
+        scaffold_include_chirality=args.scaffold_include_chirality,
+        scaffold_fallback=args.scaffold_fallback,
         split_seed=args.split_seed,
         split_train=args.split_train,
         split_val=args.split_val,
@@ -1471,6 +1670,11 @@ def main() -> None:
                     shuffle_samples=False,
                     split=args.split,
                     split_key=args.split_key,
+                    split_method=args.split_method,
+                    scaffold_group_key=args.scaffold_group_key,
+                    scaffold_smiles_key=args.scaffold_smiles_key,
+                    scaffold_include_chirality=args.scaffold_include_chirality,
+                    scaffold_fallback=args.scaffold_fallback,
                     split_seed=args.split_seed,
                     split_train=args.split_train,
                     split_val=args.split_val,

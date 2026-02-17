@@ -9,6 +9,9 @@ REMOTE_REPO="${REMOTE_REPO:-/fsx/repos/hp-proteins-ml}"
 PY="${PY:-/home/ec2-user/miniforge3/envs/hp/bin/python}"
 SSH_OPTS="${SSH_OPTS:--o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/tmp/codex_known_hosts}"
 RUN_PREFIX="${RUN_PREFIX:-tune-hij}"
+TASK="${TASK:-Hij}"
+CHECKPOINT="${CHECKPOINT:-}"
+NORM_CACHE="${NORM_CACHE:-}"
 DETACH="${DETACH:-1}"
 START_TB="${START_TB:-1}"
 INSTALL_PROFILING="${INSTALL_PROFILING:-1}"
@@ -22,11 +25,23 @@ STAGE_SHARDS_PER_DATASET="${STAGE_SHARDS_PER_DATASET:-0}"
 STAGE_TOTAL_SHARDS="${STAGE_TOTAL_SHARDS:-0}"
 STAGE_SEED="${STAGE_SEED:-123}"
 MIN_SAMPLES="${MIN_SAMPLES:-10}"
+SPLIT_KEY="${SPLIT_KEY:-mol_key}"
+SPLIT_METHOD="${SPLIT_METHOD:-hash}"
+SCAFFOLD_GROUP_KEY="${SCAFFOLD_GROUP_KEY:-mol_key}"
+SCAFFOLD_SMILES_KEY="${SCAFFOLD_SMILES_KEY:-smile}"
+SCAFFOLD_INCLUDE_CHIRALITY="${SCAFFOLD_INCLUDE_CHIRALITY:-0}"
+SCAFFOLD_FALLBACK="${SCAFFOLD_FALLBACK:-molecule}"
+SPLIT_TRAIN="${SPLIT_TRAIN:-0.7}"
+SPLIT_VAL="${SPLIT_VAL:-0.1}"
 EVAL_EVERY_STEPS="${EVAL_EVERY_STEPS:-0}"
 STEP_EVAL_MAX_BATCHES="${STEP_EVAL_MAX_BATCHES:-0}"
 STEP_EVAL_INCLUDE_TEST="${STEP_EVAL_INCLUDE_TEST:-0}"
 EPOCH_EVAL_MAX_BATCHES="${EPOCH_EVAL_MAX_BATCHES:-0}"
 # ================================
+
+if [ "$TASK" != "Hij" ] && [ "$RUN_PREFIX" = "tune-hij" ]; then
+  RUN_PREFIX="tune-${TASK}"
+fi
 
 echo ">> Using HOST=$HOST"
 echo ">> Ray dashboard tunnel: ssh ${SSH_OPTS} -i ${KEY} -N -L 8265:127.0.0.1:8265 ${HOST}"
@@ -56,12 +71,15 @@ fi
 
 echo ">> Run remote Ray Tune"
 ssh ${SSH_OPTS} -i "${KEY}" "${HOST}" \
-  "PY='$PY' REMOTE_REPO='$REMOTE_REPO' RUN_PREFIX='$RUN_PREFIX' DETACH='$DETACH' START_TB='$START_TB' INSTALL_PROFILING='$INSTALL_PROFILING' CLEAN_TB='$CLEAN_TB' SMOKE='$SMOKE' SMOKE_SHARDS='${SMOKE_SHARDS:-}' SMOKE_ITEMS='${SMOKE_ITEMS:-}' SMOKE_ITEMS_PER_SHARD='${SMOKE_ITEMS_PER_SHARD:-}' SMOKE_SPLIT_KEY='${SMOKE_SPLIT_KEY:-}' SMOKE_SPLIT_TRAIN='${SMOKE_SPLIT_TRAIN:-}' SMOKE_SPLIT_VAL='${SMOKE_SPLIT_VAL:-}' SMOKE_SPLIT_SEED='${SMOKE_SPLIT_SEED:-}' LOG_PREDS_MAX='${LOG_PREDS_MAX:-}' TRAIN_USE_DISTRIBUTED='${TRAIN_USE_DISTRIBUTED:-}' LOG_TRAIN_PREDS='${LOG_TRAIN_PREDS:-}' EPOCHS='${EPOCHS:-}' EVAL_EVERY='${EVAL_EVERY:-}' EVAL_EVERY_STEPS='${EVAL_EVERY_STEPS:-}' STEP_EVAL_MAX_BATCHES='${STEP_EVAL_MAX_BATCHES:-}' STEP_EVAL_INCLUDE_TEST='${STEP_EVAL_INCLUDE_TEST:-}' EPOCH_EVAL_MAX_BATCHES='${EPOCH_EVAL_MAX_BATCHES:-}' MAX_T='${MAX_T:-}' STAGE_SHARDS='${STAGE_SHARDS:-}' STAGE_DIR='${STAGE_DIR:-}' STAGE_LIMIT_GB='${STAGE_LIMIT_GB:-}' SHARD_ROOTS='${SHARD_ROOTS:-}' STAGE_SHARDS_PER_DATASET='${STAGE_SHARDS_PER_DATASET:-}' STAGE_TOTAL_SHARDS='${STAGE_TOTAL_SHARDS:-}' STAGE_SEED='${STAGE_SEED:-}' MIN_SAMPLES='${MIN_SAMPLES:-}' NUM_WORKERS='${NUM_WORKERS:-}' LOADER_TIMEOUT='${LOADER_TIMEOUT:-}' PREFETCH_FACTOR='${PREFETCH_FACTOR:-}' PERSISTENT_WORKERS='${PERSISTENT_WORKERS:-}' LOG_EVERY='${LOG_EVERY:-}' DDP_TIMEOUT='${DDP_TIMEOUT:-}' GPUS_PER_TRIAL='${GPUS_PER_TRIAL:-}' MAX_CONCURRENT='${MAX_CONCURRENT:-}' NUM_SAMPLES='${NUM_SAMPLES:-}' FIXED_LR='${FIXED_LR:-}' FIXED_BATCH_SIZE='${FIXED_BATCH_SIZE:-}' FIXED_ADALORA_R='${FIXED_ADALORA_R:-}' FIXED_ADALORA_ALPHA='${FIXED_ADALORA_ALPHA:-}' bash -s" <<'REMOTE'
+  "PY='$PY' REMOTE_REPO='$REMOTE_REPO' RUN_PREFIX='$RUN_PREFIX' TASK='${TASK:-}' CHECKPOINT='${CHECKPOINT:-}' NORM_CACHE='${NORM_CACHE:-}' DETACH='$DETACH' START_TB='$START_TB' INSTALL_PROFILING='$INSTALL_PROFILING' CLEAN_TB='$CLEAN_TB' SMOKE='$SMOKE' SMOKE_SHARDS='${SMOKE_SHARDS:-}' SMOKE_ITEMS='${SMOKE_ITEMS:-}' SMOKE_ITEMS_PER_SHARD='${SMOKE_ITEMS_PER_SHARD:-}' SMOKE_SPLIT_KEY='${SMOKE_SPLIT_KEY:-}' SMOKE_SPLIT_TRAIN='${SMOKE_SPLIT_TRAIN:-}' SMOKE_SPLIT_VAL='${SMOKE_SPLIT_VAL:-}' SMOKE_SPLIT_SEED='${SMOKE_SPLIT_SEED:-}' SPLIT_KEY='${SPLIT_KEY:-}' SPLIT_METHOD='${SPLIT_METHOD:-}' SCAFFOLD_GROUP_KEY='${SCAFFOLD_GROUP_KEY:-}' SCAFFOLD_SMILES_KEY='${SCAFFOLD_SMILES_KEY:-}' SCAFFOLD_INCLUDE_CHIRALITY='${SCAFFOLD_INCLUDE_CHIRALITY:-}' SCAFFOLD_FALLBACK='${SCAFFOLD_FALLBACK:-}' SPLIT_TRAIN='${SPLIT_TRAIN:-}' SPLIT_VAL='${SPLIT_VAL:-}' LOG_PREDS_MAX='${LOG_PREDS_MAX:-}' TRAIN_USE_DISTRIBUTED='${TRAIN_USE_DISTRIBUTED:-}' LOG_TRAIN_PREDS='${LOG_TRAIN_PREDS:-}' EPOCHS='${EPOCHS:-}' EVAL_EVERY='${EVAL_EVERY:-}' EVAL_EVERY_STEPS='${EVAL_EVERY_STEPS:-}' STEP_EVAL_MAX_BATCHES='${STEP_EVAL_MAX_BATCHES:-}' STEP_EVAL_INCLUDE_TEST='${STEP_EVAL_INCLUDE_TEST:-}' EPOCH_EVAL_MAX_BATCHES='${EPOCH_EVAL_MAX_BATCHES:-}' MAX_T='${MAX_T:-}' STAGE_SHARDS='${STAGE_SHARDS:-}' STAGE_DIR='${STAGE_DIR:-}' STAGE_LIMIT_GB='${STAGE_LIMIT_GB:-}' SHARD_ROOTS='${SHARD_ROOTS:-}' STAGE_SHARDS_PER_DATASET='${STAGE_SHARDS_PER_DATASET:-}' STAGE_TOTAL_SHARDS='${STAGE_TOTAL_SHARDS:-}' STAGE_SEED='${STAGE_SEED:-}' MIN_SAMPLES='${MIN_SAMPLES:-}' NUM_WORKERS='${NUM_WORKERS:-}' LOADER_TIMEOUT='${LOADER_TIMEOUT:-}' PREFETCH_FACTOR='${PREFETCH_FACTOR:-}' PERSISTENT_WORKERS='${PERSISTENT_WORKERS:-}' LOG_EVERY='${LOG_EVERY:-}' DDP_TIMEOUT='${DDP_TIMEOUT:-}' GPUS_PER_TRIAL='${GPUS_PER_TRIAL:-}' MAX_CONCURRENT='${MAX_CONCURRENT:-}' NUM_SAMPLES='${NUM_SAMPLES:-}' FIXED_LR='${FIXED_LR:-}' FIXED_BATCH_SIZE='${FIXED_BATCH_SIZE:-}' FIXED_ADALORA_R='${FIXED_ADALORA_R:-}' FIXED_ADALORA_ALPHA='${FIXED_ADALORA_ALPHA:-}' bash -s" <<'REMOTE'
 set -euo pipefail
 
 PY="$PY"
 REPO="$REMOTE_REPO"
 RUN_PREFIX="${RUN_PREFIX:-tune-hij}"
+TASK="${TASK:-Hij}"
+CHECKPOINT="${CHECKPOINT:-/fsx/repos/hp-proteins-ml/capsule-3259363/code/trained_param/qm9spectra/${TASK}.pth}"
+NORM_CACHE="${NORM_CACHE:-}"
 DETACH="${DETACH:-0}"
 START_TB="${START_TB:-1}"
 INSTALL_PROFILING="${INSTALL_PROFILING:-1}"
@@ -74,6 +92,7 @@ SMOKE_SPLIT_KEY="${SMOKE_SPLIT_KEY:-smoke_key}"
 SMOKE_SPLIT_TRAIN="${SMOKE_SPLIT_TRAIN:-0.6}"
 SMOKE_SPLIT_VAL="${SMOKE_SPLIT_VAL:-0.0}"
 SMOKE_SPLIT_SEED="${SMOKE_SPLIT_SEED:-123}"
+SMOKE_TASK="${SMOKE_TASK:-$TASK}"
 TRAIN_USE_DISTRIBUTED="${TRAIN_USE_DISTRIBUTED:-1}"
 USER_TRAIN_USE_DISTRIBUTED="${USER_TRAIN_USE_DISTRIBUTED:-}"
 LOG_TRAIN_PREDS="${LOG_TRAIN_PREDS:-0}"
@@ -113,6 +132,9 @@ RAY_CLI="$(dirname "$PY")/ray"
 if [ "$SMOKE" = "1" ] && [ "${SMOKE_ITEMS_PER_SHARD}" -gt 0 ] && [ "${SMOKE_SPLIT_VAL}" = "0.0" ]; then
   SMOKE_SPLIT_VAL="0.2"
 fi
+
+echo ">> Training task: ${TASK}"
+echo ">> Checkpoint: ${CHECKPOINT}"
 
 if [ "${PERSISTENT_WORKERS}" = "1" ]; then
   PERSISTENT_WORKERS_FLAG="--persistent-workers"
@@ -390,36 +412,52 @@ PY
   echo ">> Using staged shard list: $SHARD_LIST"
 fi
 
-SPLIT_KEY="mol_key"
-SPLIT_TRAIN="0.7"
-SPLIT_VAL="0.1"
+SPLIT_KEY="${SPLIT_KEY:-mol_key}"
+SPLIT_METHOD="${SPLIT_METHOD:-hash}"
+SCAFFOLD_GROUP_KEY="${SCAFFOLD_GROUP_KEY:-mol_key}"
+SCAFFOLD_SMILES_KEY="${SCAFFOLD_SMILES_KEY:-smile}"
+SCAFFOLD_INCLUDE_CHIRALITY="${SCAFFOLD_INCLUDE_CHIRALITY:-0}"
+SCAFFOLD_FALLBACK="${SCAFFOLD_FALLBACK:-molecule}"
+SPLIT_TRAIN="${SPLIT_TRAIN:-0.7}"
+SPLIT_VAL="${SPLIT_VAL:-0.1}"
 LOG_PREDS="0"
 
 if [ "$PREFLIGHT" = "1" ]; then
   export SHARD_LIST
+  export TASK
   export SPLIT_KEY
+  export SPLIT_METHOD
+  export SCAFFOLD_GROUP_KEY
+  export SCAFFOLD_SMILES_KEY
+  export SCAFFOLD_INCLUDE_CHIRALITY
+  export SCAFFOLD_FALLBACK
   export SPLIT_TRAIN
   export SPLIT_VAL
+  export SPLIT_SEED
   export PREFLIGHT_SHARDS
   export PREFLIGHT_FULL_SHARDS
   export MIN_SAMPLES
   "$PY" - <<'PY'
-import hashlib
-import math
 import os
 import random
 from pathlib import Path
 
 import torch
+from train.train_detanet import _resolve_split_token, _split_label
 
 shard_list = os.environ["SHARD_LIST"]
 split_key = os.environ["SPLIT_KEY"]
+split_method = os.environ.get("SPLIT_METHOD", "hash")
+scaffold_group_key = os.environ.get("SCAFFOLD_GROUP_KEY", "mol_key")
+scaffold_smiles_key = os.environ.get("SCAFFOLD_SMILES_KEY", "smile")
+scaffold_include_chirality = os.environ.get("SCAFFOLD_INCLUDE_CHIRALITY", "0") in ("1", "true", "True")
+scaffold_fallback = os.environ.get("SCAFFOLD_FALLBACK", "molecule")
 split_train = float(os.environ["SPLIT_TRAIN"])
 split_val = float(os.environ["SPLIT_VAL"])
+split_seed = int(os.environ.get("SPLIT_SEED", "123"))
 pref_shards = int(os.environ.get("PREFLIGHT_SHARDS", "5"))
 full_limit = int(os.environ.get("PREFLIGHT_FULL_SHARDS", "20"))
 min_samples = int(os.environ.get("MIN_SAMPLES", "10"))
-seed = 123
 
 paths = [p.strip() for p in Path(shard_list).read_text().splitlines() if p.strip()]
 if not paths:
@@ -429,35 +467,18 @@ if len(paths) <= full_limit:
     sample_paths = paths
     sampled = False
 else:
-    random.seed(seed)
+    random.seed(split_seed)
     sample_paths = random.sample(paths, k=min(pref_shards, len(paths)))
     sampled = True
 
-def split_label(key: str) -> str:
-    digest = hashlib.md5(f"{seed}:{key}".encode()).hexdigest()
-    bucket = int(digest, 16) % 1000
-    train_cutoff = int(split_train * 1000)
-    val_cutoff = int((split_train + split_val) * 1000)
-    if bucket < train_cutoff:
-        return "train"
-    if bucket < val_cutoff:
-        return "val"
-    return "test"
-
-def normalize_key(value) -> str:
-    if torch.is_tensor(value):
-        if value.numel() == 1:
-            value = value.item()
-        else:
-            value = value.flatten()[0].item()
-    return str(value)
-
 counts = {"total": 0, "finite": 0, "train": 0, "val": 0, "test": 0}
+task = os.environ.get("TASK", "Hij")
+split_cache = {}
 for path in sample_paths:
     data = torch.load(path, map_location="cpu", weights_only=False)
     for item in data:
         counts["total"] += 1
-        target = getattr(item, "Hij", None)
+        target = getattr(item, task, None)
         if target is None:
             continue
         pos = getattr(item, "pos", None)
@@ -468,12 +489,19 @@ for path in sample_paths:
         if torch.is_tensor(pos) and not torch.isfinite(pos).all().item():
             continue
         counts["finite"] += 1
-        key_val = getattr(item, split_key, None)
-        if key_val is None:
-            key_val = getattr(item, "number", None)
-        if key_val is None:
+        token = _resolve_split_token(
+            item,
+            split_method=split_method,
+            split_key=split_key,
+            scaffold_group_key=scaffold_group_key,
+            scaffold_smiles_key=scaffold_smiles_key,
+            scaffold_include_chirality=scaffold_include_chirality,
+            scaffold_fallback=scaffold_fallback,
+            split_cache=split_cache,
+        )
+        if token is None:
             continue
-        label = split_label(normalize_key(key_val))
+        label = _split_label(token, split_seed, split_train, split_val)
         counts[label] += 1
 
 prefix = "Sampled" if sampled else "Full"
@@ -507,6 +535,7 @@ elif [ "$SMOKE" = "1" ] && [ "${SMOKE_ITEMS}" -gt 0 ]; then
   export SMOKE_SPLIT_TRAIN
   export SMOKE_SPLIT_VAL
   export SMOKE_SPLIT_SEED
+  export SMOKE_TASK
   "$PY" - <<'PY'
 import hashlib
 import math
@@ -630,6 +659,7 @@ elif [ "$SMOKE" = "1" ] && [ "${SMOKE_ITEMS_PER_SHARD}" -gt 0 ]; then
   export SMOKE_SPLIT_TRAIN
   export SMOKE_SPLIT_VAL
   export SMOKE_SPLIT_SEED
+  export SMOKE_TASK
   "$PY" - <<'PY'
 import hashlib
 import math
@@ -791,7 +821,15 @@ fi
 
 # Base args (JSON list) -- build after SMOKE updates and GPU sizing
 export SHARD_LIST
+export TASK
+export CHECKPOINT
+export NORM_CACHE
 export SPLIT_KEY
+export SPLIT_METHOD
+export SCAFFOLD_GROUP_KEY
+export SCAFFOLD_SMILES_KEY
+export SCAFFOLD_INCLUDE_CHIRALITY
+export SCAFFOLD_FALLBACK
 export SPLIT_TRAIN
 export SPLIT_VAL
 export EPOCHS
@@ -819,16 +857,24 @@ import os
 
 args = [
     "--task",
-    "Hij",
+    os.environ["TASK"],
     "--shard-list",
     os.environ["SHARD_LIST"],
     "--checkpoint",
-    "/fsx/repos/hp-proteins-ml/capsule-3259363/code/trained_param/qm9spectra/Hij.pth",
+    os.environ["CHECKPOINT"],
     "--no-checkpoint-strict",
     "--checkpoint-relax-embeddings",
     "--checkpoint-relax-mismatch",
     "--split-key",
     os.environ["SPLIT_KEY"],
+    "--split-method",
+    os.environ.get("SPLIT_METHOD", "hash"),
+    "--scaffold-group-key",
+    os.environ.get("SCAFFOLD_GROUP_KEY", "mol_key"),
+    "--scaffold-smiles-key",
+    os.environ.get("SCAFFOLD_SMILES_KEY", "smile"),
+    "--scaffold-fallback",
+    os.environ.get("SCAFFOLD_FALLBACK", "molecule"),
     "--split-train",
     os.environ["SPLIT_TRAIN"],
     "--split-val",
@@ -859,8 +905,6 @@ args = [
     "--skip-bad-batches",
     "--normalize",
     "dataset",
-    "--norm-cache",
-    "/fsx/model_registry/norm_cache_hij.json",
     "--exclude-keys",
     "mol_key,subset,source,smile,field_source,field_generated,field_imputed,field_confidence,conformer_id",
     "--num-workers",
@@ -879,6 +923,14 @@ if os.environ.get("LOG_TRAIN_PREDS") == "1":
     args += ["--log-train-preds"]
 if os.environ.get("STEP_EVAL_INCLUDE_TEST", "0") in ("1", "true", "True"):
     args += ["--step-eval-include-test"]
+if os.environ.get("SCAFFOLD_INCLUDE_CHIRALITY", "0") in ("1", "true", "True"):
+    args += ["--scaffold-include-chirality"]
+norm_cache = os.environ.get("NORM_CACHE", "")
+if not norm_cache:
+    task_name = os.environ.get("TASK", "task")
+    safe = "".join(ch.lower() if ch.isalnum() else "_" for ch in task_name)
+    norm_cache = f"/fsx/model_registry/norm_cache_{safe}.json"
+args += ["--norm-cache", norm_cache]
 if os.environ.get("TRAIN_USE_DISTRIBUTED", "1") in ("0", "false", "False"):
     args += ["--no-train-use-distributed"]
 

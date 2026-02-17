@@ -34,8 +34,9 @@ from train.train_detanet import (
     _build_optimizer,
     _build_scheduler,
     _compute_stats,
+    _ensure_rdkit_available,
     _list_shards,
-    _normalize_split_key,
+    _resolve_split_token,
     _split_label,
     build_model,
     load_checkpoint,
@@ -81,14 +82,33 @@ def _is_finite_item(item, task: str) -> bool:
     return True
 
 
-def _infer_split(item, split_key: str, split_seed: int, split_train: float, split_val: float) -> Optional[str]:
-    key_val = getattr(item, split_key, None)
-    if key_val is None and split_key != "number":
-        key_val = getattr(item, "number", None)
-    if key_val is None:
+def _infer_split(
+    item,
+    *,
+    split_key: str,
+    split_method: str,
+    split_seed: int,
+    split_train: float,
+    split_val: float,
+    scaffold_group_key: str,
+    scaffold_smiles_key: str,
+    scaffold_include_chirality: bool,
+    scaffold_fallback: str,
+    split_cache: Optional[Dict[str, str]] = None,
+) -> Optional[str]:
+    token = _resolve_split_token(
+        item,
+        split_method=split_method,
+        split_key=split_key,
+        scaffold_group_key=scaffold_group_key,
+        scaffold_smiles_key=scaffold_smiles_key,
+        scaffold_include_chirality=scaffold_include_chirality,
+        scaffold_fallback=scaffold_fallback,
+        split_cache=split_cache,
+    )
+    if token is None:
         return None
-    key = _normalize_split_key(key_val)
-    return _split_label(key, split_seed, split_train, split_val)
+    return _split_label(token, split_seed, split_train, split_val)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -155,6 +175,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-train-preds", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--log-preds-max", type=int, default=5)
     parser.add_argument("--split-key", default="mol_key")
+    parser.add_argument("--split-method", default="hash", choices=["hash", "scaffold"])
+    parser.add_argument("--scaffold-group-key", default="mol_key")
+    parser.add_argument("--scaffold-smiles-key", default="smile")
+    parser.add_argument(
+        "--scaffold-include-chirality",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--scaffold-fallback", default="molecule", choices=["molecule", "global"])
     parser.add_argument("--split-seed", type=int, default=123)
     parser.add_argument("--split-train", type=float, default=0.8)
     parser.add_argument("--split-val", type=float, default=0.1)
@@ -172,6 +201,10 @@ def build_config(base_args: List[str], overrides: Dict[str, Any]) -> Dict[str, A
         setattr(args, key, value)
     args.split_train = 0.7
     args.split_val = 0.1
+    args.split_method = str(args.split_method).lower()
+    args.scaffold_fallback = str(args.scaffold_fallback).lower()
+    if args.split_method == "scaffold":
+        _ensure_rdkit_available()
     if args.use_elora and not args.elora_path:
         args.elora_path = "vendored"
     cfg = vars(args)
@@ -187,6 +220,7 @@ def _rows_from_shard(row: Dict[str, Any], cfg: Dict[str, Any]) -> List[Dict[str,
 
     data_list = torch.load(io.BytesIO(row["bytes"]), map_location="cpu", weights_only=False)
     out: List[Dict[str, Any]] = []
+    split_cache: Dict[str, str] = {}
     exclude_keys = _parse_exclude_keys(cfg["exclude_keys"])
     for item in data_list:
         if getattr(item, cfg["task"], None) is None:
@@ -202,10 +236,16 @@ def _rows_from_shard(row: Dict[str, Any], cfg: Dict[str, Any]) -> List[Dict[str,
         )
         split = _infer_split(
             item,
-            cfg["split_key"],
-            cfg["split_seed"],
-            cfg["split_train"],
-            cfg["split_val"],
+            split_key=cfg["split_key"],
+            split_method=cfg.get("split_method", "hash"),
+            split_seed=cfg["split_seed"],
+            split_train=cfg["split_train"],
+            split_val=cfg["split_val"],
+            scaffold_group_key=cfg.get("scaffold_group_key", "mol_key"),
+            scaffold_smiles_key=cfg.get("scaffold_smiles_key", "smile"),
+            scaffold_include_chirality=bool(cfg.get("scaffold_include_chirality", False)),
+            scaffold_fallback=cfg.get("scaffold_fallback", "molecule"),
+            split_cache=split_cache,
         )
         if split is None:
             continue
