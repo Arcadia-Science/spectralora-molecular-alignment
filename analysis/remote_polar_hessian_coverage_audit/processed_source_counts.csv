@@ -1,0 +1,7 @@
+source,processed_samples,processed_unique_molecules
+1000.hdf5,409648,935
+2000.hdf5,442582,935
+3000.hdf5,50800,70
+Donchev et al. DES5M.csv,10000,10000
+SPICE-2.0.1.hdf5,1193850,32223
+summary.csv.gz,59600,59600

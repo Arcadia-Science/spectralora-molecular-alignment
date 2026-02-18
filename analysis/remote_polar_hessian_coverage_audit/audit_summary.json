@@ -1,0 +1,40 @@
+{
+  "coverage": {
+    "avg_items_per_shard": 49.74353087043372,
+    "estimated_unprocessed_shards": 443308,
+    "total_unprocessed_conformations": 22051660,
+    "total_unprocessed_molecules": 17962209
+  },
+  "datasets_root": "/fsx/Datasets",
+  "hessian": {
+    "items_with_hi": 2166480,
+    "items_with_hij": 2166480,
+    "items_with_joint_hessian": 2166480,
+    "unique_hi": 2056618,
+    "unique_hij": 2056625,
+    "unique_joint_hessian": 2056625
+  },
+  "outputs": {
+    "family_coverage_csv": "/tmp/polar_hessian_coverage_audit/family_coverage.csv",
+    "processed_source_counts_csv": "/tmp/polar_hessian_coverage_audit/processed_source_counts.csv",
+    "source_coverage_csv": "/tmp/polar_hessian_coverage_audit/source_coverage.csv",
+    "unique_hi_hashes": "/tmp/polar_hessian_coverage_audit/unique_hi.hash",
+    "unique_hij_hashes": "/tmp/polar_hessian_coverage_audit/unique_hij.hash",
+    "unique_joint_hessian_hashes": "/tmp/polar_hessian_coverage_audit/unique_joint_hessian.hash",
+    "unique_mol_source": "/tmp/polar_hessian_coverage_audit/unique_mol_source.tsv"
+  },
+  "processed_root": "/fsx/processed_all",
+  "scan_counts": {
+    "items_total": 2166480,
+    "items_valid": 2166480,
+    "items_with_hi": 2166480,
+    "items_with_hi_finite": 2166480,
+    "items_with_hij": 2166480,
+    "items_with_hij_finite": 2166480,
+    "items_with_joint_hessian": 2166480,
+    "items_with_mol_id": 2166480
+  },
+  "shards_found": 43553,
+  "task": "polar",
+  "workers": 24
+}
