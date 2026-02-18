@@ -1,0 +1,7 @@
+family,dataset,sub_dataset,train,val,total
+des5m,des5m,default,7100,795,7895
+qm7x,qm7x,1000,318756,23211,341967
+qm7x,qm7x,2000,267044,13837,280881
+qm7x,qm7x,3000,32744,0,32744
+qm9,summary_csv,default,41281,5677,46958
+spice,spice-2.0.1,default,803836,111071,914907

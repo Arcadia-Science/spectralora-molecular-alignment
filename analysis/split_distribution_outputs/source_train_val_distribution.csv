@@ -1,0 +1,7 @@
+source,train,val
+SPICE-2.0.1.hdf5,803836,111071
+1000.hdf5,318756,23211
+2000.hdf5,267044,13837
+summary.csv.gz,41281,5677
+3000.hdf5,32744,0
+Donchev et al. DES5M.csv,7100,795

@@ -1456,7 +1456,7 @@ def main() -> None:
     parser.add_argument(
         "--single-force-all-splits",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="In single-sample mode, ignore split filtering for val/test and reuse the same sample.",
     )
     parser.add_argument(

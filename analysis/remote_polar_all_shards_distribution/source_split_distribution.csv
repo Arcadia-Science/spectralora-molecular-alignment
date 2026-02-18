@@ -1,0 +1,18 @@
+source,split,count
+1000.hdf5,test,67681
+1000.hdf5,train,318756
+1000.hdf5,val,23211
+2000.hdf5,test,161701
+2000.hdf5,train,267044
+2000.hdf5,val,13837
+3000.hdf5,test,18056
+3000.hdf5,train,32744
+Donchev et al. DES5M.csv,test,2105
+Donchev et al. DES5M.csv,train,7100
+Donchev et al. DES5M.csv,val,795
+SPICE-2.0.1.hdf5,test,278943
+SPICE-2.0.1.hdf5,train,803836
+SPICE-2.0.1.hdf5,val,111071
+summary.csv.gz,test,12642
+summary.csv.gz,train,41281
+summary.csv.gz,val,5677

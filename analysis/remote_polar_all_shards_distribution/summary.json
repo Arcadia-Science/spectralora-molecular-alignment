@@ -1,0 +1,38 @@
+{
+  "meta": {
+    "items_total": 2166480,
+    "items_valid": 2166480
+  },
+  "molecule_conflicts": 0,
+  "outputs": {
+    "dataset_csv": "/tmp/polar_all_shards_distribution/dataset_split_distribution.csv",
+    "family_csv": "/tmp/polar_all_shards_distribution/family_split_distribution.csv",
+    "source_csv": "/tmp/polar_all_shards_distribution/source_split_distribution.csv",
+    "summary_json": "/tmp/polar_all_shards_distribution/summary.json"
+  },
+  "params": {
+    "scaffold_fallback": "molecule",
+    "scaffold_group_key": "mol_key",
+    "scaffold_include_chirality": false,
+    "scaffold_smiles_key": "smile",
+    "skip_nonfinite": true,
+    "split_key": "mol_key",
+    "split_method": "scaffold",
+    "split_seed": 123,
+    "split_train": 0.7,
+    "split_val": 0.1,
+    "task": "polar"
+  },
+  "root": "/fsx/processed_all",
+  "shards_found": 43553,
+  "split_counts": {
+    "test": 541128,
+    "train": 1470761,
+    "val": 154591
+  },
+  "test_total": 541128,
+  "train_total": 1470761,
+  "unique_molecules_seen": 34163,
+  "unknown_examples": [],
+  "val_total": 154591
+}
