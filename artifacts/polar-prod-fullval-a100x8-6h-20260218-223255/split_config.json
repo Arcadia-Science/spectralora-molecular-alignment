@@ -1,0 +1,12 @@
+{
+  "scaffold_fallback": "molecule",
+  "scaffold_group_key": "mol_key",
+  "scaffold_include_chirality": false,
+  "scaffold_smiles_key": "smile",
+  "split": "train",
+  "split_key": "mol_key",
+  "split_method": "scaffold",
+  "split_seed": 123,
+  "split_train": 0.8,
+  "split_val": 0.1
+}
