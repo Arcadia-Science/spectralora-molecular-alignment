@@ -4,6 +4,7 @@ import argparse
 import copy
 import contextlib
 import hashlib
+import inspect
 import json
 import os
 import random
@@ -1019,6 +1020,31 @@ def _build_scheduler(
     raise ValueError(f"unknown scheduler: {args.lr_scheduler}")
 
 
+def _warmup_scale(step_idx: int, warmup_steps: int, start_factor: float) -> float:
+    if warmup_steps <= 0:
+        return 1.0
+    warmup_steps = max(1, warmup_steps)
+    start_factor = float(min(1.0, max(0.0, start_factor)))
+    if step_idx >= warmup_steps:
+        return 1.0
+    if warmup_steps == 1:
+        return 1.0
+    progress = float(step_idx) / float(warmup_steps - 1)
+    return start_factor + (1.0 - start_factor) * progress
+
+
+def _apply_warmup_lr(
+    optimizer: torch.optim.Optimizer,
+    base_lrs: list[float],
+    step_idx: int,
+    warmup_steps: int,
+    start_factor: float,
+) -> None:
+    scale = _warmup_scale(step_idx, warmup_steps, start_factor)
+    for group, base_lr in zip(optimizer.param_groups, base_lrs):
+        group["lr"] = base_lr * scale
+
+
 def build_model(args) -> nn.Module:
     if args.task not in TASK_CONFIGS:
         raise KeyError(f"Unknown task {args.task}. Available: {sorted(TASK_CONFIGS)}")
@@ -1033,6 +1059,8 @@ def build_model(args) -> nn.Module:
             attention_head=args.attention_head,
             rc=args.rc,
             dropout=args.dropout,
+            pre_layernorm=args.pre_layernorm,
+            pre_layernorm_eps=args.pre_layernorm_eps,
             elora_path=args.elora_path,
             device=args.device,
         )
@@ -1044,7 +1072,7 @@ def build_model(args) -> nn.Module:
             from peft import AdaLoraConfig, TaskType
         except Exception as exc:
             raise RuntimeError("peft is required for AdaLoRA.") from exc
-        adalora_config = AdaLoraConfig(
+        adalora_kwargs = dict(
             r=args.adalora_r,
             init_r=args.adalora_r,
             lora_alpha=args.adalora_alpha,
@@ -1054,11 +1082,18 @@ def build_model(args) -> nn.Module:
             total_step=args.adalora_total_step,
             task_type=TaskType.FEATURE_EXTRACTION,
         )
+        adalora_signature = inspect.signature(AdaLoraConfig.__init__)
+        if args.adalora_target_r is not None and "target_r" in adalora_signature.parameters:
+            adalora_kwargs["target_r"] = args.adalora_target_r
+        if "use_rslora" in adalora_signature.parameters:
+            adalora_kwargs["use_rslora"] = bool(args.adalora_rslora)
+        adalora_config = AdaLoraConfig(**adalora_kwargs)
         config["adalora_config"] = adalora_config
         if args.adalora_targets:
             config["adalora_targets"] = [t.strip() for t in args.adalora_targets.split(",") if t.strip()]
         config["adalora_scalar_heads"] = args.adalora_scalar_heads
         config["adalora_attention"] = args.adalora_attention
+        config["adalora_all_linears"] = args.adalora_all_linears
         config["adapter_freeze_base"] = args.adapter_freeze_base
 
     model = DetaNet(**config)
@@ -1240,7 +1275,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--exclude-keys",
-        default="field_imputed,field_generated,field_confidence,field_source,smile,source",
+        default="field_imputed,field_generated,field_confidence,field_source,smile,source,subset,conformer_id,mol_key",
         help="Comma-separated list of Data keys to exclude from PyG collation.",
     )
 
@@ -1250,20 +1285,25 @@ def main() -> None:
     parser.add_argument("--attention-head", type=int, default=8)
     parser.add_argument("--rc", type=float, default=5.0)
     parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--pre-layernorm", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--pre-layernorm-eps", type=float, default=1e-5)
 
     parser.add_argument("--use-elora", action="store_true")
     parser.add_argument("--elora-path", default=None, help="Path to ELoRA repo or 'vendored'.")
 
     parser.add_argument("--use-adalora", action="store_true")
     parser.add_argument("--adalora-r", type=int, default=32)
+    parser.add_argument("--adalora-target-r", type=int, default=None)
     parser.add_argument("--adalora-alpha", type=int, default=64)
     parser.add_argument("--adalora-dropout", type=float, default=0.05)
     parser.add_argument("--adalora-tinit", type=int, default=10)
     parser.add_argument("--adalora-tfinal", type=int, default=20)
     parser.add_argument("--adalora-total-step", type=int, default=1000)
+    parser.add_argument("--adalora-rslora", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--adalora-targets", default=None)
     parser.add_argument("--adalora-scalar-heads", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--adalora-attention", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--adalora-all-linears", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--adapter-freeze-base", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--ddp-find-unused-parameters",
@@ -1291,6 +1331,10 @@ def main() -> None:
     parser.add_argument("--lr-scheduler", default="cosine", choices=["none", "cosine", "step"])
     parser.add_argument("--lr-step-size", type=int, default=10)
     parser.add_argument("--lr-gamma", type=float, default=0.5)
+    parser.add_argument("--warmup-steps", type=int, default=0)
+    parser.add_argument("--warmup-start-factor", type=float, default=0.1)
+    parser.add_argument("--l2-penalty", type=float, default=0.0)
+    parser.add_argument("--l2-include-bias", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--resume-path", default=None)
     parser.add_argument("--save-state", action=argparse.BooleanOptionalAction, default=True)
@@ -1787,15 +1831,19 @@ def main() -> None:
     optimizer = _build_optimizer(args, model)
     scheduler = _build_scheduler(args, optimizer)
     scaler = torch.amp.GradScaler('cuda',enabled=amp_enabled)
+    warmup_base_lrs = [group["lr"] for group in optimizer.param_groups]
 
     resume_epoch = 0
     global_step = 0
+    optimizer_step = 0
     if args.resume:
         resume_path = Path(args.resume_path) if args.resume_path else run_dir / f"latest_{args.task}_state.pth"
         if resume_path.exists():
             extra = load_state(model, optimizer, scheduler, scaler, resume_path, strict=args.checkpoint_strict)
             resume_epoch = int(extra.get("epoch", 0))
             global_step = int(extra.get("global_step", 0))
+            optimizer_step = int(extra.get("optimizer_step", global_step // max(1, args.grad_accum)))
+            warmup_base_lrs = [group["lr"] for group in optimizer.param_groups]
             if rank == 0:
                 print(f"resumed from {resume_path} at epoch={resume_epoch} step={global_step}")
         elif rank == 0:
@@ -1947,11 +1995,27 @@ def main() -> None:
                 tb_writer.add_scalar(f"{prefix}/test_mse", metrics["test_mse"], x_val)
                 tb_writer.add_scalar(f"{prefix}/test_mae", metrics["test_mae"], x_val)
 
+    l2_params: list[torch.Tensor] = []
+    if args.l2_penalty > 0:
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if not args.l2_include_bias and name.lower().endswith("bias"):
+                continue
+            l2_params.append(param)
+        if rank == 0:
+            print(
+                f"l2_penalty enabled: coeff={args.l2_penalty:g} "
+                f"params={len(l2_params)} include_bias={args.l2_include_bias}"
+            )
+
     for epoch in range(resume_epoch, args.epochs):
         train_dataset.set_epoch(epoch)
         model.train()
         running = 0.0
+        running_mse = 0.0
         epoch_loss_sum = 0.0
+        epoch_mse_sum = 0.0
         epoch_loss_count = 0
         step = -1
         skipped_batches = 0
@@ -2052,9 +2116,15 @@ def main() -> None:
                         skipped_batches += 1
                         continue
 
-                loss = ((pred - target) ** 2 * mask).sum() / mask.sum().clamp(min=1.0)
-                loss_unscaled = loss
-                loss = loss / args.grad_accum
+                mse_loss = ((pred - target) ** 2 * mask).sum() / mask.sum().clamp(min=1.0)
+                l2_loss = torch.zeros((), device=mse_loss.device, dtype=mse_loss.dtype)
+                if l2_params:
+                    l2_accum = torch.zeros((), device=mse_loss.device, dtype=torch.float32)
+                    for param in l2_params:
+                        l2_accum = l2_accum + param.float().pow(2).sum()
+                    l2_loss = mse_loss.new_tensor(float(args.l2_penalty)) * l2_accum.to(mse_loss.dtype)
+                loss_unscaled = mse_loss + l2_loss
+                loss = loss_unscaled / args.grad_accum
                 if args.skip_nonfinite:
                     loss_bad = not torch.isfinite(loss).all().item()
                     if _sync_skip(loss_bad, args.device):
@@ -2076,8 +2146,17 @@ def main() -> None:
                             optimizer.zero_grad(set_to_none=True)
                             scaler.update()
                             continue
+                    if args.warmup_steps > 0 and optimizer_step < args.warmup_steps:
+                        _apply_warmup_lr(
+                            optimizer,
+                            warmup_base_lrs,
+                            optimizer_step,
+                            args.warmup_steps,
+                            args.warmup_start_factor,
+                        )
                     scaler.step(optimizer)
                     scaler.update()
+                    optimizer_step += 1
             except Exception:
                 if args.skip_bad_batches:
                     if _sync_skip(True, args.device):
@@ -2089,18 +2168,22 @@ def main() -> None:
                 raise
 
             running += loss_unscaled.item()
+            running_mse += mse_loss.item()
             epoch_loss_sum += loss_unscaled.item()
+            epoch_mse_sum += mse_loss.item()
             epoch_loss_count += 1
             global_step += 1
             if rank == 0 and (global_step % args.log_every == 0):
                 avg_loss = running / max(1, args.log_every)
+                avg_mse = running_mse / max(1, args.log_every)
                 lr = optimizer.param_groups[0]["lr"]
-                print(f"epoch={epoch} step={global_step} loss={avg_loss:.6f} lr={lr:.6e}")
+                print(f"epoch={epoch} step={global_step} loss={avg_loss:.6f} mse={avg_mse:.6f} lr={lr:.6e}")
                 metrics_row = {
                     "epoch": epoch,
                     "step": global_step,
                     "split": "train",
                     "loss": avg_loss,
+                    "train_mse": avg_mse,
                     "lr": lr,
                 }
                 if args.log_train_preds:
@@ -2119,17 +2202,20 @@ def main() -> None:
                     wandb_run.log({"train/step_loss": avg_loss, "lr": lr}, step=global_step)
                 if tb_writer:
                     tb_writer.add_scalar("train/step_loss", avg_loss, global_step)
+                    tb_writer.add_scalar("train/step_mse", avg_mse, global_step)
                     tb_writer.add_scalar("train/lr", lr, global_step)
                 running = 0.0
+                running_mse = 0.0
 
             if args.eval_every_steps > 0 and global_step > 0 and (global_step % args.eval_every_steps == 0):
                 train_loss_so_far = epoch_loss_sum / max(1, epoch_loss_count)
+                train_mse_so_far = epoch_mse_sum / max(1, epoch_loss_count)
                 _run_eval(
                     eval_scope="step",
                     epoch_idx=epoch,
                     global_step_idx=global_step,
                     train_loss_value=train_loss_so_far,
-                    train_mse_value=train_loss_so_far,
+                    train_mse_value=train_mse_so_far,
                     run_test=bool(args.step_eval_include_test),
                     max_batches=args.step_eval_max_batches,
                     log_samples=False,
@@ -2137,19 +2223,32 @@ def main() -> None:
                 model.train()
 
         if step >= 0 and (step + 1) % args.grad_accum != 0:
+            if args.warmup_steps > 0 and optimizer_step < args.warmup_steps:
+                _apply_warmup_lr(
+                    optimizer,
+                    warmup_base_lrs,
+                    optimizer_step,
+                    args.warmup_steps,
+                    args.warmup_start_factor,
+                )
             scaler.step(optimizer)
             scaler.update()
+            optimizer_step += 1
 
         if scheduler:
             scheduler.step()
+            if optimizer_step < args.warmup_steps:
+                warmup_base_lrs = [group["lr"] for group in optimizer.param_groups]
 
         train_loss_epoch = epoch_loss_sum
+        train_mse_epoch = epoch_mse_sum
         train_loss_count = epoch_loss_count
         if dist.is_available() and dist.is_initialized():
             train_loss_epoch = _sync_sum_float(train_loss_epoch, args.device)
+            train_mse_epoch = _sync_sum_float(train_mse_epoch, args.device)
             train_loss_count = _sync_sum(train_loss_count, args.device)
         train_loss_epoch = train_loss_epoch / max(1, train_loss_count)
-        train_mse_epoch = train_loss_epoch
+        train_mse_epoch = train_mse_epoch / max(1, train_loss_count)
 
         if rank == 0:
             if skipped_batches:
@@ -2161,7 +2260,7 @@ def main() -> None:
             save_checkpoint(model, save_path, args.fsdp)
             if args.save_state:
                 state_path = run_dir / f"latest_{args.task}_state.pth"
-                extra = {"epoch": epoch + 1, "global_step": global_step}
+                extra = {"epoch": epoch + 1, "global_step": global_step, "optimizer_step": optimizer_step}
                 save_state(model, optimizer, scheduler, scaler, state_path, args.fsdp, extra=extra)
             print(f"saved {save_path}")
             metrics_row = {

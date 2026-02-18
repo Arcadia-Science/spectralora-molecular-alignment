@@ -12,13 +12,24 @@ class Interaction_Block(nn.Module):
                  irreps_sh,
                  irreps_T,
                  dropout,
-                 e3nn=None
+                 e3nn=None,
+                 pre_layernorm=False,
+                 layernorm_eps=1e-5,
                  ):
         super(Interaction_Block,self).__init__()
-        self.message=Message(head=head,num_radial=num_radial,act=act,
-                             num_features=num_features,irreps_sh=irreps_sh,e3nn=e3nn)
+        self.message=Message(
+            head=head,
+            num_radial=num_radial,
+            act=act,
+            num_features=num_features,
+            irreps_sh=irreps_sh,
+            e3nn=e3nn,
+            pre_layernorm=pre_layernorm,
+            layernorm_eps=layernorm_eps,
+        )
         self.update=Update(num_features=num_features,act=act,irreps_mout=self.message.tp.irreps_out,
-                           irreps_T=irreps_T,dropout=dropout,e3nn=e3nn)
+                           irreps_T=irreps_T,dropout=dropout,e3nn=e3nn,
+                           pre_layernorm=pre_layernorm,layernorm_eps=layernorm_eps)
 
     def forward(self,S,T,rbf,sh,index):
         mijt,mijs=self.message(S=S,rbf=rbf,sh=sh,index=index)

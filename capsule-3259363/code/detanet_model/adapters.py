@@ -9,10 +9,14 @@ def collect_adalora_targets(
     model: nn.Module,
     include_scalar_heads: bool = True,
     include_attention: bool = True,
+    include_all_linears: bool = False,
 ) -> List[str]:
     targets: List[str] = []
     for name, module in model.named_modules():
         if not isinstance(module, nn.Linear):
+            continue
+        if include_all_linears:
+            targets.append(name)
             continue
         if include_scalar_heads and name.startswith("sout."):
             targets.append(name)

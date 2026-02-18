@@ -3,9 +3,10 @@ from .acts import activations
 
 class Edge_Attention(nn.Module):
     '''Radial attention module'''
-    def __init__(self,num_radial,num_features,act,head=8):
+    def __init__(self,num_radial,num_features,act,head=8,pre_layernorm=False,layernorm_eps=1e-5):
         super(Edge_Attention,self).__init__()
         self.head=head
+        self.pre_ln = nn.LayerNorm(num_features, eps=layernorm_eps) if pre_layernorm else nn.Identity()
         self.actq = activations(act,num_features=num_features)
         self.actk = activations(act, num_features=num_features)
         self.actv = activations(act, num_features=2*num_features)
@@ -46,6 +47,7 @@ class Edge_Attention(nn.Module):
 
     def forward(self,S,rbf,index):
         i,j=index
+        S = self.pre_ln(S)
         #The invariant feature S through 3 different linear layers to obtain query,key and value node feature
         sq=self.actq(self.lq(S))
         sk=self.actk(self.lk(S))

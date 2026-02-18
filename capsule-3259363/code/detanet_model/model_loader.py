@@ -24,8 +24,10 @@ BASE_MODEL_CONFIG = {
 TASK_CONFIGS = {
     "energy": dict(scalar_outsize=1, irreps_out=None, summation=True, out_type="scalar", grad_type=None),
     "force": dict(scalar_outsize=1, irreps_out=None, summation=True, out_type="scalar", grad_type="force"),
+    "tran_energy": dict(scalar_outsize=10, irreps_out=None, summation=True, out_type="scalar", grad_type=None),
     "npacharge": dict(scalar_outsize=1, irreps_out=None, summation=False, out_type="scalar", grad_type=None),
     "dipole": dict(scalar_outsize=1, irreps_out="1o", summation=True, out_type="dipole", grad_type=None),
+    "tran_dipole": dict(scalar_outsize=10, irreps_out="1o", summation=True, out_type="dipole", grad_type=None),
     "polar": dict(scalar_outsize=2, irreps_out="2e", summation=True, out_type="2_tensor", grad_type=None),
     "quadrupole": dict(scalar_outsize=2, irreps_out="2e", summation=True, out_type="2_tensor", grad_type=None),
     "hyperpolar": dict(scalar_outsize=2, irreps_out="1o+3o", summation=True, out_type="3_tensor", grad_type=None),

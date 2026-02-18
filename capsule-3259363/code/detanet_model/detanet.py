@@ -56,6 +56,9 @@ class DetaNet(nn.Module):
                  adalora_targets:list=None,
                  adalora_scalar_heads:bool=True,
                  adalora_attention:bool=True,
+                 adalora_all_linears:bool=False,
+                 pre_layernorm:bool=False,
+                 pre_layernorm_eps:float=1e-5,
                  adapter_freeze_base:bool=True):
         """Parameter introduction
     num_features:The dimension of the scalar feature and irreps feature(each order m), set to 128 by default.
@@ -156,7 +159,14 @@ class DetaNet(nn.Module):
         irrs_sh=o3.Irreps.spherical_harmonics(lmax=maxl, p=-1)
         # Removal of scalars with l=0
         self.irreps_sh=irrs_sh[1:]
-        self.Embedding=Embedding(num_features=num_features,act=act,device=device,max_atomic_number=max_atomic_number)
+        self.Embedding=Embedding(
+            num_features=num_features,
+            act=act,
+            device=device,
+            max_atomic_number=max_atomic_number,
+            pre_layernorm=pre_layernorm,
+            layernorm_eps=pre_layernorm_eps,
+        )
         self.Radial=Radial_Basis(radial_type=radial_type,num_radial=num_radial,use_cutoff=use_cutoff)
         blocks = []
         # interaction layers
@@ -168,7 +178,9 @@ class DetaNet(nn.Module):
                         irreps_sh=self.irreps_sh,
                         irreps_T=irreps_T,
                         dropout=dropout,
-                        e3nn=self._e3nn
+                        e3nn=self._e3nn,
+                        pre_layernorm=pre_layernorm,
+                        layernorm_eps=pre_layernorm_eps,
                         )
             blocks.append(block)
         self.blocks=nn.Sequential(*blocks)
@@ -203,6 +215,7 @@ class DetaNet(nn.Module):
                     self,
                     include_scalar_heads=adalora_scalar_heads,
                     include_attention=adalora_attention,
+                    include_all_linears=adalora_all_linears,
                 )
             apply_adalora(
                 self,

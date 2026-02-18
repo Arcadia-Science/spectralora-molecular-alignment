@@ -141,10 +141,19 @@ def get_elec_feature(max_atomic_number,device):
     return (elec / elec.max()).to(device)
 
 class Embedding(nn.Module):
-    def __init__(self,num_features,act,max_atomic_number=118,device=device('cuda')):
+    def __init__(
+        self,
+        num_features,
+        act,
+        max_atomic_number=118,
+        device=device('cuda'),
+        pre_layernorm=False,
+        layernorm_eps=1e-5,
+    ):
         super(Embedding,self).__init__()
         self.elec=get_elec_feature(max_atomic_number=max_atomic_number,device=device)
         self.act=activations(type=act,num_features=num_features)
+        self.pre_ln = nn.LayerNorm(num_features, eps=layernorm_eps) if pre_layernorm else nn.Identity()
         elec_dim = self.elec.shape[1]
         self.elec_emb = nn.Linear(elec_dim, num_features, bias=False)
         self.nuclare_emb = nn.Embedding(max_atomic_number+1, num_features)
@@ -162,4 +171,6 @@ class Embedding(nn.Module):
         The initial invariant feature of an atom consists of a mixture of nuclear one-hot and electronic features
         S0=ls(ln(O(z))+lq(Q(z)))
         '''
-        return self.act(self.ls(self.nuclare_emb(z)+self.elec_emb(self.elec[z,:])))
+        x = self.nuclare_emb(z) + self.elec_emb(self.elec[z, :])
+        x = self.pre_ln(x)
+        return self.act(self.ls(x))

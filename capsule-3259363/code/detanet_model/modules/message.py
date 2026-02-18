@@ -5,13 +5,20 @@ from ..e3nn_backend import load_e3nn
 
 class Message(nn.Module):
     '''Message Module'''
-    def __init__(self,head,num_radial,num_features,irreps_sh,act,e3nn=None):
+    def __init__(self,head,num_radial,num_features,irreps_sh,act,e3nn=None,pre_layernorm=False,layernorm_eps=1e-5):
         super(Message,self).__init__()
         if e3nn is None:
             e3nn = load_e3nn()
         o3 = e3nn.o3
         self.feature=num_features
-        self.Attention=Edge_Attention(head=head,num_radial=num_radial,num_features=num_features,act=act)
+        self.Attention=Edge_Attention(
+            head=head,
+            num_radial=num_radial,
+            num_features=num_features,
+            act=act,
+            pre_layernorm=pre_layernorm,
+            layernorm_eps=layernorm_eps,
+        )
         irreps_mout = []
         instructions = []
         # Tensor product of irrep tensor features generated from scalar features and irrep tensor
