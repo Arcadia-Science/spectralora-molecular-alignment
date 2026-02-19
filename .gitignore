@@ -231,3 +231,4 @@ scripts/ec2_env.example
 scripts/mount_fsx.sh
 AGENTS.md
 smoke.md
+scripts/queue_spectra_after_dipole_remote.sh
