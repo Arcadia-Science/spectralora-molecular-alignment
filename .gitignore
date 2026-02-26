@@ -237,3 +237,6 @@ AGENTS.md
 smoke.md
 scripts/queue_spectra_after_dipole_remote.sh
 ramanchembl_pipeline/PLAN.md
+ramanchembl_pipeline/dataset/*
+ramanchembl_pipeline/debugging_pipeline.ipynb
+ramanchembl_pipeline/artifacts
