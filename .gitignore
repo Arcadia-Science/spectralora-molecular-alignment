@@ -240,3 +240,5 @@ ramanchembl_pipeline/PLAN.md
 ramanchembl_pipeline/dataset/*
 ramanchembl_pipeline/debugging_pipeline.ipynb
 ramanchembl_pipeline/artifacts
+*.plan.md
+plan.md
