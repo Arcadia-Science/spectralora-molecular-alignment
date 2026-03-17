@@ -105,9 +105,9 @@ app = modal.App("raman-alignment", image=image)
 # Training function
 # ---------------------------------------------------------------------------
 @app.function(
-    gpu="H100",
+    gpu="H200",
     volumes={"/data": vol},
-    timeout=7200,   # 2 hrs ceiling — training should finish in ~30 min
+    timeout=10800,  # 3 hrs — v12 two-phase training needs more time
     memory=32768,   # 32 GB RAM — dataset arrays for 10K molecules are ~4 GB
 )
 def train_alignment(
@@ -263,6 +263,45 @@ def train_alignment(
             out_dir=out_dir,
             device=device,
             train_config=cfg,
+        )
+
+    elif model_type == "peak_v12":
+        # -------------------------------------------------------------------
+        # v12: Hybrid Soft-F1 + REINFORCE keep/drop (two-phase training)
+        # -------------------------------------------------------------------
+        hybrid_cfg = lib.AlignmentHybridConfig(
+            phase1_epochs=100,
+            phase1_batch_size=256,
+            phase1_lr=3e-4,
+            phase1_patience=40,
+            phase2_epochs=max(max_epochs - 100, 150),
+            phase2_batch_size=128,
+            phase2_lr=5e-5,
+            phase2_patience=30,
+            latent_dim=latent_dim,
+            transformer_layers=transformer_layers,
+            transformer_heads=transformer_heads,
+            soft_f1_tol=10.0,
+            soft_f1_tau_init=3.0,
+            soft_f1_tau_min=0.5,
+            sinkhorn_tau=10.0,
+            dnh_radius=10.0,
+            dnh_weight=0.0,
+            entropy_coeff=0.05,
+            rl_weight=0.3,
+            rl_K=8,
+            reward_tol=10.0,
+            mode_feature_dim=12,
+            match_cutoff=15.0,
+        )
+        print("Hybrid Config:", hybrid_cfg)
+
+        results = lib.run_hybrid_training(
+            dft_dataset=dataset,
+            out_dir=out_dir,
+            device=device,
+            hybrid_config=hybrid_cfg,
+            checkpoint_path=None,  # start fresh — v10 checkpoint is a bad local minimum for soft-F1
         )
 
     elif model_type == "peak_v10":
