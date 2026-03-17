@@ -102,6 +102,40 @@ class AlignmentTrainConfig:
     sinkhorn_match_sigma: float = 10.0  # soft match width (cm⁻¹)
     # v10: per-mode eigenvector features from hessfreq
     mode_feature_dim: int = 0  # 12 for eigenvector features, 0 for legacy
+    # v11: DETR-style dynamic re-matching (0 = disabled)
+    detr_rematch_every: int = 0  # re-compute Hungarian matching every N epochs using corrected freqs
+    # v11: Differentiable soft-F1 loss
+    use_soft_f1: bool = False
+    soft_f1_tol: float = 10.0    # match tolerance (cm⁻¹) — same as eval F1@10
+    soft_f1_tau: float = 3.0     # sigmoid temperature (anneal warm→cold during training)
+    soft_f1_tau_min: float = 0.5 # final tau after annealing
+
+@dataclass
+class AlignmentRLConfig:
+    """REINFORCE fine-tuning config. F1@10 as non-differentiable reward."""
+    seed: int = 42
+    max_epochs: int = 100
+    batch_size: int = 128
+    lr: float = 3e-5
+    weight_decay: float = 1e-4
+    K: int = 8                    # samples per molecule per step
+    sigma_init: float = 5.0       # initial freq exploration std (cm⁻¹)
+    sigma_learnable: bool = True
+    sigma_min: float = 0.5
+    sigma_max: float = 20.0
+    entropy_coeff: float = 0.01
+    grad_clip: float = 1.0
+    patience: int = 30
+    val_fraction: float = 0.15
+    test_fraction: float = 0.15
+    freeze_encoder: bool = False  # freeze transformer, only tune heads
+    conf_loss_weight: float = 0.5 # supervised confidence BCE auxiliary
+    confidence_threshold: float = 0.5
+    match_cutoff: float = 15.0
+    string_feature_dim: int = 128
+    mode_feature_dim: int = 12
+    reward_tol: float = 10.0     # F1@{tol} as reward
+    top_k_filter: int = 0        # >0: fixed top-k by intensity (skip confidence sampling)
 
 class ModeArrayDataset(Dataset):
     def __init__(self, mol_features, pf, pi, pm, tf, ti, tm, mi, mm, mode_features=None):
@@ -320,8 +354,10 @@ def _sinkhorn_alignment_loss(out, tf, ti, pm, tm, mi, mm, cfg):
         # Soft match quality
         soft_match = torch.exp(-cost ** 2 / sigma2)
 
-        # 1. Transport cost (mean frequency error weighted by assignment)
-        loss_freq = (P * cost).sum() / n_pred
+        # 1. Transport cost — weighted by confidence so unmatched modes
+        #    (low confidence) don't dominate the gradient
+        per_pred_cost = (P * cost).sum(dim=1)  # (n_pred,)
+        loss_freq = (p_conf.detach() * per_pred_cost).sum() / (p_conf.detach().sum() + EPS)
 
         # 2. Coverage: for each target, how well is it covered by predictions?
         coverage = (P * soft_match).sum(dim=0).clamp(max=1.0)  # (n_target,)
@@ -355,6 +391,91 @@ def _sinkhorn_alignment_loss(out, tf, ti, pm, tm, mi, mm, cfg):
     components = {
         "freq": acc_freq / count, "cov": acc_cov / count,
         "conf": acc_conf / count, "int": acc_int / count,
+    }
+    return total_loss / count, components
+
+
+def _soft_f1_loss(out, tf, ti, pm, tm, mi, mm, cfg):
+    """
+    v11 loss: Differentiable soft-F1 with Sinkhorn assignment.
+
+    Instead of optimizing transport cost (proxy), directly optimizes a smooth
+    approximation of F1@tol:
+      soft_match_ij = sigmoid((tol - |pred_i - target_j|) / tau)
+      soft_TP = sum_j max_i (P_ij * soft_match_ij)
+      soft_F1 = 2 * soft_TP / (n_pred_kept + n_target)
+
+    tau anneals from warm (smooth) to cold (sharp) via cfg.soft_f1_tau.
+    """
+    pf_all = out["corrected_freq"]
+    pi_all = out["corrected_intensity"]
+    conf_all = out["confidence"]
+    batch_size = pf_all.shape[0]
+    total_loss = 0.0
+    acc_f1 = acc_conf = acc_int = 0.0
+    count = 0
+
+    tol = cfg.soft_f1_tol
+    tau = cfg.soft_f1_tau
+
+    for b in range(batch_size):
+        idx_p = pm[b] > 0.5
+        idx_t = tm[b] > 0.5
+        if not idx_p.any() or not idx_t.any():
+            continue
+
+        p_f = pf_all[b][idx_p]
+        p_i = pi_all[b][idx_p]
+        p_conf = conf_all[b][idx_p]
+        t_f = tf[b][idx_t]
+        t_i = ti[b][idx_t]
+        n_pred = len(p_f)
+        n_target = len(t_f)
+
+        # Distance matrix
+        dist = torch.abs(p_f.unsqueeze(1) - t_f.unsqueeze(0))  # (n_pred, n_target)
+
+        # Soft assignment via Sinkhorn (each pred -> distribution over targets)
+        P = F.softmax(-dist / cfg.sinkhorn_tau, dim=1)  # (n_pred, n_target)
+
+        # Soft match: sigmoid threshold at `tol` cm⁻¹
+        soft_match = torch.sigmoid((tol - dist) / tau)  # (n_pred, n_target)
+
+        # Soft TP: for each target, best (assignment-weighted) soft match
+        # weighted_match_ij = P_ij * soft_match_ij * conf_i
+        weighted = P * soft_match * p_conf.unsqueeze(1)  # (n_pred, n_target)
+        # Per-target: sum over predictions (soft "is this target covered by a confident, close pred?")
+        target_covered = weighted.sum(dim=0).clamp(max=1.0)  # (n_target,)
+        soft_tp = target_covered.sum()
+
+        # Soft n_pred_kept = sum of confidences (differentiable count of kept modes)
+        soft_n_pred = p_conf.sum()
+
+        # Soft F1 = 2*TP / (n_pred_kept + n_target)
+        soft_f1 = 2 * soft_tp / (soft_n_pred + n_target + EPS)
+        loss_f1 = 1.0 - soft_f1  # minimize
+
+        # Intensity loss on well-matched pairs
+        per_pred_quality = (P * soft_match).sum(dim=1)  # (n_pred,)
+        t_i_max = t_i.max() + EPS
+        p_i_target = (P * (t_i / t_i_max).unsqueeze(0)).sum(dim=1)
+        loss_int = (per_pred_quality.detach() * torch.abs(p_i - p_i_target)).mean()
+
+        # Confidence regularization: entropy to prevent collapse to all-0 or all-1
+        conf_ent = -(p_conf * torch.log(p_conf + EPS)
+                     + (1 - p_conf) * torch.log(1 - p_conf + EPS)).mean()
+
+        total_loss += cfg.freq_loss_weight * loss_f1 + 0.5 * loss_int - 0.01 * conf_ent
+        acc_f1 += soft_f1.item()
+        acc_int += loss_int.item()
+        acc_conf += soft_n_pred.item() / n_pred  # fraction kept
+        count += 1
+
+    if count == 0:
+        return pf_all.sum() * 0.0, {}
+    components = {
+        "soft_f1": acc_f1 / count, "int": acc_int / count,
+        "conf_frac": acc_conf / count,
     }
     return total_loss / count, components
 
@@ -782,6 +903,28 @@ def _evaluate_coordinate_alignment(pf, pi, pm, tf, ti, tm, confidence=None, conf
 
     return base
 
+
+def _compute_f1_reward_batch(corr_freq, pred_mask, keep_mask, target_freq, target_mask, tol=10.0):
+    """F1@tol for a batch. All inputs are numpy. Returns (B,) float array."""
+    B = corr_freq.shape[0]
+    rewards = np.zeros(B, dtype=np.float32)
+    for b in range(B):
+        idx_p = (pred_mask[b] > 0.5) & (keep_mask[b] > 0.5)
+        idx_t = target_mask[b] > 0.5
+        if not idx_p.any() or not idx_t.any():
+            continue
+        p_f = corr_freq[b][idx_p]
+        t_f = target_freq[b][idx_t]
+        dist = np.abs(p_f[:, None] - t_f[None, :])
+        p_idx, t_idx = _lsa(dist)
+        tp = float((dist[p_idx, t_idx] <= tol).sum())
+        n_pred, n_target = len(p_f), len(t_f)
+        prec = tp / n_pred if n_pred > 0 else 0.0
+        rec = tp / n_target if n_target > 0 else 0.0
+        rewards[b] = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+    return rewards
+
+
 def run_alignment_study(*, experimental_dataset, dft_dataset, out_dir, device="cpu", train_config=None, **kwargs):
     cfg = train_config or AlignmentTrainConfig()
     out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
@@ -847,10 +990,57 @@ def run_alignment_study(*, experimental_dataset, dft_dataset, out_dir, device="c
                               tight_mm[splits["val"]], _slice_mode_feats(splits["val"]))
     val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False)
 
-    _loss_fn = _sinkhorn_alignment_loss if cfg.use_sinkhorn else _supervised_alignment_loss
+    if cfg.use_soft_f1:
+        _loss_fn = _soft_f1_loss
+    elif cfg.use_sinkhorn:
+        _loss_fn = _sinkhorn_alignment_loss
+    else:
+        _loss_fn = _supervised_alignment_loss
+
+    # Arrays needed for DETR-style re-matching
+    _train_idx = splits["train"]
+    _train_pf_orig = dft_dataset.pred_freq[_train_idx]
+    _train_pm_orig = dft_dataset.pred_mask[_train_idx]
+    _train_tf = dft_dataset.target_freq[_train_idx]
+    _train_tm = dft_dataset.target_mask[_train_idx]
+    _train_mol_t = torch.as_tensor(dft_mol[_train_idx], device=device)
+    _train_pf_t = torch.as_tensor(_train_pf_orig, device=device, dtype=torch.float32)
+    _train_pi_t = torch.as_tensor(dft_dataset.pred_intensity[_train_idx], device=device, dtype=torch.float32)
+    _train_pm_t = torch.as_tensor(_train_pm_orig, device=device, dtype=torch.float32)
+    _train_mf_t = (torch.as_tensor(dft_mode_feats[_train_idx], device=device, dtype=torch.float32)
+                   if dft_mode_feats is not None else None)
+
+    if cfg.detr_rematch_every > 0:
+        print(f"DETR-style dynamic re-matching every {cfg.detr_rematch_every} epochs")
 
     print(f"Training on {device} | train={len(splits['train'])} val={len(splits['val'])} test={len(splits['test'])}")
     for epoch in range(cfg.max_epochs):
+        # --- DETR-style: recompute matching with model's current corrections ---
+        if cfg.detr_rematch_every > 0 and epoch > 0 and epoch % cfg.detr_rematch_every == 0:
+            model.eval()
+            with torch.no_grad():
+                # Forward pass on all training data in chunks
+                corr_freqs = []
+                chunk_sz = 512
+                for c0 in range(0, len(_train_idx), chunk_sz):
+                    c1 = min(c0 + chunk_sz, len(_train_idx))
+                    _mf_chunk = _train_mf_t[c0:c1] if _train_mf_t is not None else None
+                    pred_out = model(_train_mol_t[c0:c1], _train_pf_t[c0:c1],
+                                     _train_pi_t[c0:c1], _train_pm_t[c0:c1], _mf_chunk)
+                    corr_freqs.append(pred_out["corrected_freq"].cpu().numpy())
+                corr_freq_np = np.concatenate(corr_freqs, axis=0)
+
+            # Re-match using corrected freqs
+            new_mi, new_mm = _compute_match_indices(
+                corr_freq_np, _train_pm_orig, _train_tf, _train_tm,
+                cutoff=cfg.match_cutoff,
+            )
+            old_matched = train_ds.mm.sum().item()
+            train_ds.mi = torch.as_tensor(new_mi, dtype=torch.long)
+            train_ds.mm = torch.as_tensor(new_mm, dtype=torch.float32)
+            new_matched = new_mm.sum()
+            print(f"  [DETR rematch @ epoch {epoch}] matched modes: {old_matched:.0f} → {new_matched:.0f}")
+
         model.train()
         l_acc = 0.0
         for b in loader:
@@ -862,6 +1052,11 @@ def run_alignment_study(*, experimental_dataset, dft_dataset, out_dir, device="c
             opt.step()
             l_acc += loss.item()
         scheduler.step()
+
+        # Anneal soft-F1 temperature (warm → cold)
+        if cfg.use_soft_f1 and cfg.soft_f1_tau > cfg.soft_f1_tau_min:
+            frac = epoch / max(cfg.max_epochs - 1, 1)
+            cfg.soft_f1_tau = cfg.soft_f1_tau * (1 - frac) + cfg.soft_f1_tau_min * frac
 
         # Validation for early stopping
         model.eval()
@@ -1041,6 +1236,374 @@ def run_alignment_study(*, experimental_dataset, dft_dataset, out_dir, device="c
         "summary_json": str(out_dir / "summary.json"),
         "checkpoint": str(ckpt_path),
     }
+
+def run_rl_finetune(*, dft_dataset, out_dir, device="cpu", rl_config=None, checkpoint_path=None):
+    """
+    REINFORCE fine-tuning with F1@10 as non-differentiable reward.
+    Loads a pre-trained checkpoint, then optimizes freq corrections via
+    policy gradient and confidence via supervised BCE auxiliary.
+    """
+    rl_cfg = rl_config or AlignmentRLConfig()
+    out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load pre-trained model
+    ckpt_p = Path(checkpoint_path) if checkpoint_path else (out_dir / "alignment_model.pth")
+    ckpt = torch.load(ckpt_p, map_location=device, weights_only=False)
+    base_cfg = ckpt["cfg"]
+
+    dft_mol = _augment_mol_features(dft_dataset.mol_features, dft_dataset.metadata, base_cfg.string_feature_dim)
+    model = PeakCoordinateTransformer(ckpt["mol_dim"], base_cfg, dft_dataset.x_grid).to(device)
+    state = ckpt.get("model_state", ckpt)
+    model.load_state_dict({k: v.to(device) for k, v in state.items()})
+    print(f"Loaded pre-trained checkpoint from {ckpt_p}")
+
+    # Learnable exploration sigma
+    log_sigma = nn.Parameter(torch.tensor(float(np.log(rl_cfg.sigma_init)), device=device))
+
+    if rl_cfg.freeze_encoder:
+        for name, p in model.named_parameters():
+            if "transformer" in name or "peak_embed" in name or "mol_encoder" in name:
+                p.requires_grad = False
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"Frozen encoder — {trainable:,} trainable params in heads")
+
+    params = [p for p in model.parameters() if p.requires_grad]
+    if rl_cfg.sigma_learnable:
+        params.append(log_sigma)
+    opt = torch.optim.Adam(params, lr=rl_cfg.lr, weight_decay=rl_cfg.weight_decay)
+
+    # Data
+    splits = _split_indices(len(dft_dataset), rl_cfg.seed, rl_cfg.val_fraction, rl_cfg.test_fraction)
+    dft_mode_feats = dft_dataset.mode_features
+    tight_mi, tight_mm = _compute_match_indices(
+        dft_dataset.pred_freq, dft_dataset.pred_mask,
+        dft_dataset.target_freq, dft_dataset.target_mask,
+        cutoff=rl_cfg.match_cutoff,
+    )
+
+    def _mf(idx):
+        return dft_mode_feats[idx] if dft_mode_feats is not None else None
+
+    train_ds = ModeArrayDataset(
+        dft_mol[splits["train"]], dft_dataset.pred_freq[splits["train"]],
+        dft_dataset.pred_intensity[splits["train"]], dft_dataset.pred_mask[splits["train"]],
+        dft_dataset.target_freq[splits["train"]], dft_dataset.target_intensity[splits["train"]],
+        dft_dataset.target_mask[splits["train"]], tight_mi[splits["train"]],
+        tight_mm[splits["train"]], _mf(splits["train"]))
+    loader = DataLoader(train_ds, batch_size=rl_cfg.batch_size, shuffle=True)
+
+    val_ds = ModeArrayDataset(
+        dft_mol[splits["val"]], dft_dataset.pred_freq[splits["val"]],
+        dft_dataset.pred_intensity[splits["val"]], dft_dataset.pred_mask[splits["val"]],
+        dft_dataset.target_freq[splits["val"]], dft_dataset.target_intensity[splits["val"]],
+        dft_dataset.target_mask[splits["val"]], tight_mi[splits["val"]],
+        tight_mm[splits["val"]], _mf(splits["val"]))
+    val_loader = DataLoader(val_ds, batch_size=rl_cfg.batch_size, shuffle=False)
+
+    best_val_f1, patience_cnt, best_state = 0.0, 0, None
+    print(f"RL training: K={rl_cfg.K} sigma_init={rl_cfg.sigma_init} lr={rl_cfg.lr} "
+          f"conf_aux={rl_cfg.conf_loss_weight}")
+    print(f"  train={len(splits['train'])} val={len(splits['val'])} test={len(splits['test'])}")
+
+    for epoch in range(rl_cfg.max_epochs):
+        model.train()
+        ep_reward, ep_loss, n_bat = 0.0, 0.0, 0
+
+        for batch in loader:
+            mol, pf, pi, pm, tf, ti, tm, _mi_b, mm_b, mf = [x.to(device) for x in batch]
+
+            out = model(mol, pf, pi, pm, mf)
+            mu_freq = out["corrected_freq"]   # (B, max_modes)
+            confidence = out["confidence"]     # (B, max_modes)
+            conf_clamped = confidence.clamp(1e-6, 1 - 1e-6)
+
+            sigma = torch.exp(log_sigma).clamp(rl_cfg.sigma_min, rl_cfg.sigma_max)
+
+            # Pre-compute fixed top-k mask if using top_k_filter
+            if rl_cfg.top_k_filter > 0:
+                raw_int_np = pi.cpu().numpy()
+                pm_np_batch = pm.cpu().numpy()
+                topk_mask_np = np.zeros_like(pm_np_batch)
+                for bi in range(mol.shape[0]):
+                    valid = pm_np_batch[bi] > 0.5
+                    if valid.sum() <= rl_cfg.top_k_filter:
+                        topk_mask_np[bi] = pm_np_batch[bi]
+                    else:
+                        ri = raw_int_np[bi].copy()
+                        ri[~valid] = -1
+                        keep_idx = np.argsort(ri)[-rl_cfg.top_k_filter:]
+                        topk_mask_np[bi, keep_idx] = 1.0
+                topk_mask_t = torch.tensor(topk_mask_np, device=device, dtype=torch.float32)
+
+            all_log_probs = []
+            all_rewards = []
+
+            for _k in range(rl_cfg.K):
+                # --- Sample actions ---
+                eps = torch.randn_like(mu_freq)
+                sampled_freq = (mu_freq + sigma * eps * pm).detach()
+
+                if rl_cfg.top_k_filter > 0:
+                    # Fixed top-k: only freq is stochastic
+                    keep_sample = topk_mask_t
+                    log_prob = -0.5 * ((sampled_freq - mu_freq) / sigma) ** 2 - torch.log(sigma)
+                    log_prob = (log_prob * pm).sum(dim=1)
+                else:
+                    # Bernoulli confidence sampling
+                    keep_sample = (torch.bernoulli(conf_clamped) * pm).detach()
+                    freq_lp = -0.5 * ((sampled_freq - mu_freq) / sigma) ** 2 - torch.log(sigma)
+                    freq_lp = (freq_lp * pm).sum(dim=1)
+                    keep_lp = (keep_sample * torch.log(conf_clamped)
+                               + (1 - keep_sample) * torch.log(1 - conf_clamped))
+                    keep_lp = (keep_lp * pm).sum(dim=1)
+                    log_prob = freq_lp + keep_lp
+
+                # --- Reward: F1@10 ---
+                reward = _compute_f1_reward_batch(
+                    sampled_freq.cpu().numpy(), pm.cpu().numpy(),
+                    keep_sample.detach().cpu().numpy(), tf.cpu().numpy(),
+                    tm.cpu().numpy(), tol=rl_cfg.reward_tol,
+                )
+                all_log_probs.append(log_prob)
+                all_rewards.append(torch.tensor(reward, device=device, dtype=torch.float32))
+
+            log_probs = torch.stack(all_log_probs)  # (K, B)
+            rewards = torch.stack(all_rewards)       # (K, B)
+
+            # Baseline: per-molecule mean reward
+            baseline = rewards.mean(dim=0, keepdim=True)
+            advantage = (rewards - baseline).detach()
+
+            policy_loss = -(advantage * log_probs).mean()
+
+            # Supervised confidence auxiliary (skip if using top_k_filter)
+            loss = policy_loss
+            if rl_cfg.conf_loss_weight > 0 and rl_cfg.top_k_filter == 0:
+                valid = pm > 0.5
+                if valid.any():
+                    conf_bce = F.binary_cross_entropy(
+                        confidence[valid].clamp(1e-6, 1 - 1e-6),
+                        mm_b[valid].float(),
+                        reduction="mean",
+                    )
+                    loss = loss + rl_cfg.conf_loss_weight * conf_bce
+
+            # Entropy bonus (freq only when using top_k_filter)
+            freq_ent = 0.5 * (1 + torch.log(torch.tensor(2 * np.pi, device=device) * sigma ** 2))
+            loss = loss - rl_cfg.entropy_coeff * freq_ent
+            if rl_cfg.top_k_filter == 0:
+                conf_ent = -(conf_clamped * torch.log(conf_clamped)
+                             + (1 - conf_clamped) * torch.log(1 - conf_clamped))
+                loss = loss - rl_cfg.entropy_coeff * (conf_ent * pm).mean()
+
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(params, rl_cfg.grad_clip)
+            opt.step()
+
+            ep_reward += rewards.mean().item()
+            ep_loss += loss.item()
+            n_bat += 1
+
+        # --- Validation: deterministic F1@10 (both conf-filtered and unfiltered) ---
+        model.eval()
+        val_metrics = {"f1@10": [], "f1@5": [], "coverage@10": [], "cwmae@10": [],
+                       "conf_f1@10": [], "conf_kept": [], "n_pred": []}
+        with torch.no_grad():
+            for batch in val_loader:
+                mol, pf, pi, pm, tf, ti, tm, _mi_b, _mm_b, mf = [x.to(device) for x in batch]
+                out = model(mol, pf, pi, pm, mf)
+                cf_np = out["corrected_freq"].cpu().numpy()
+                ci_np = out["corrected_intensity"].cpu().numpy()
+                conf_np = out["confidence"].cpu().numpy()
+                pm_np, tf_np, ti_np, tm_np = (
+                    pm.cpu().numpy(), tf.cpu().numpy(), ti.cpu().numpy(), tm.cpu().numpy()
+                )
+                for i in range(mol.shape[0]):
+                    # Unfiltered
+                    m = _evaluate_coordinate_alignment(
+                        cf_np[i], ci_np[i], pm_np[i], tf_np[i], ti_np[i], tm_np[i],
+                    )
+                    val_metrics["f1@10"].append(m["f1@10"])
+                    val_metrics["f1@5"].append(m["f1@5"])
+                    val_metrics["coverage@10"].append(m["coverage@10"])
+                    val_metrics["cwmae@10"].append(m["cwmae@10"])
+                    val_metrics["n_pred"].append(m["n_pred_kept"])
+                    # Conf-filtered
+                    mc = _evaluate_coordinate_alignment(
+                        cf_np[i], ci_np[i], pm_np[i], tf_np[i], ti_np[i], tm_np[i],
+                        confidence=conf_np[i], conf_threshold=rl_cfg.confidence_threshold,
+                    )
+                    val_metrics["conf_f1@10"].append(mc["f1@10"])
+                    val_metrics["conf_kept"].append(mc["n_pred_kept"])
+
+        val_f1 = float(np.mean(val_metrics["f1@10"]))
+        val_conf_f1 = float(np.mean(val_metrics["conf_f1@10"]))
+        # Track the better of filtered/unfiltered for early stopping
+        val_best_f1 = max(val_f1, val_conf_f1)
+        if val_best_f1 > best_val_f1:
+            best_val_f1 = val_best_f1
+            patience_cnt = 0
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+        else:
+            patience_cnt += 1
+
+        if epoch % 5 == 0:
+            print(f"Epoch {epoch:4d} | reward={ep_reward / max(n_bat, 1):.3f} "
+                  f"F1@10={val_f1:.3f} conf_F1@10={val_conf_f1:.3f} "
+                  f"cov@10={np.mean(val_metrics['coverage@10']):.3f} "
+                  f"cwmae={np.mean(val_metrics['cwmae@10']):.2f} "
+                  f"kept={np.mean(val_metrics['conf_kept']):.0f}/{np.mean(val_metrics['n_pred']):.0f} "
+                  f"sigma={sigma.item():.2f} best={best_val_f1:.3f} pat={patience_cnt}")
+        if patience_cnt >= rl_cfg.patience:
+            print(f"Early stopping at epoch {epoch}")
+            break
+
+    # Restore best & save
+    if best_state is not None:
+        model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+    rl_ckpt_path = out_dir / "alignment_model_rl.pth"
+    torch.save({
+        "model_state": best_state or model.state_dict(),
+        "cfg": base_cfg, "rl_cfg": rl_cfg,
+        "mol_dim": ckpt["mol_dim"], "x_grid": dft_dataset.x_grid,
+    }, rl_ckpt_path)
+    print(f"RL checkpoint → {rl_ckpt_path}")
+
+    # --- Full eval ---
+    model.eval()
+    mf_all = (torch.as_tensor(dft_mode_feats, device=device, dtype=torch.float32)
+              if dft_mode_feats is not None else None)
+    with torch.no_grad():
+        pred = model(
+            torch.as_tensor(dft_mol, device=device),
+            torch.as_tensor(dft_dataset.pred_freq, device=device, dtype=torch.float32),
+            torch.as_tensor(dft_dataset.pred_intensity, device=device, dtype=torch.float32),
+            torch.as_tensor(dft_dataset.pred_mask, device=device, dtype=torch.float32),
+            mf_all,
+        )
+        pf_corr = pred["corrected_freq"].cpu().numpy()
+        pi_corr = pred["corrected_intensity"].cpu().numpy()
+        conf_arr = pred["confidence"].cpu().numpy()
+
+    case_rows = []
+    for i in range(len(dft_dataset)):
+        metrics_all = _evaluate_coordinate_alignment(
+            pf_corr[i], pi_corr[i], dft_dataset.pred_mask[i],
+            dft_dataset.target_freq[i], dft_dataset.target_intensity[i],
+            dft_dataset.target_mask[i],
+        )
+        metrics_conf = _evaluate_coordinate_alignment(
+            pf_corr[i], pi_corr[i], dft_dataset.pred_mask[i],
+            dft_dataset.target_freq[i], dft_dataset.target_intensity[i],
+            dft_dataset.target_mask[i],
+            confidence=conf_arr[i], conf_threshold=rl_cfg.confidence_threshold,
+        )
+        row = {"case_index": i, "model": "peak_rl_v10"}
+        row.update(metrics_all)
+        row.update({f"conf_{k}": v for k, v in metrics_conf.items()})
+        case_rows.append(row)
+
+    case_df = pd.DataFrame(case_rows)
+    case_csv = out_dir / "dft_alignment_rl_cases.csv"
+    case_df.to_csv(case_csv, index=False)
+
+    # Top-k intensity sweep (val → test)
+    print("\n=== Top-k intensity sweep (val set) ===")
+    best_k, best_f1_val = 0, 0.0
+    for top_k in [30, 40, 50, 60, 70, 80, 90, 100]:
+        f1s = []
+        for i in splits["val"]:
+            pm_i = dft_dataset.pred_mask[i]
+            valid = pm_i > 0.5
+            if valid.sum() <= top_k:
+                f1s.append(_evaluate_coordinate_alignment(
+                    pf_corr[i], pi_corr[i], pm_i,
+                    dft_dataset.target_freq[i], dft_dataset.target_intensity[i],
+                    dft_dataset.target_mask[i])["f1@10"])
+                continue
+            raw_int = dft_dataset.pred_intensity[i].copy()
+            raw_int[~valid] = -1
+            keep_idx = np.argsort(raw_int)[-top_k:]
+            topk_mask = np.zeros_like(pm_i)
+            topk_mask[keep_idx] = 1.0
+            f1s.append(_evaluate_coordinate_alignment(
+                pf_corr[i], pi_corr[i], topk_mask,
+                dft_dataset.target_freq[i], dft_dataset.target_intensity[i],
+                dft_dataset.target_mask[i])["f1@10"])
+        mean_f1 = np.mean(f1s)
+        print(f"  top_k={top_k:3d} | val F1@10={mean_f1:.3f}")
+        if mean_f1 > best_f1_val:
+            best_f1_val = mean_f1
+            best_k = top_k
+
+    test_f1s, test_cov = [], []
+    for i in splits["test"]:
+        pm_i = dft_dataset.pred_mask[i]
+        valid = pm_i > 0.5
+        if valid.sum() <= best_k:
+            topk_mask = pm_i.copy()
+        else:
+            raw_int = dft_dataset.pred_intensity[i].copy()
+            raw_int[~valid] = -1
+            keep_idx = np.argsort(raw_int)[-best_k:]
+            topk_mask = np.zeros_like(pm_i)
+            topk_mask[keep_idx] = 1.0
+        m = _evaluate_coordinate_alignment(
+            pf_corr[i], pi_corr[i], topk_mask,
+            dft_dataset.target_freq[i], dft_dataset.target_intensity[i],
+            dft_dataset.target_mask[i])
+        test_f1s.append(m["f1@10"])
+        test_cov.append(m["coverage@10"])
+    print(f"  BEST: top_k={best_k} | test F1@10={np.mean(test_f1s):.3f}  "
+          f"Coverage@10={np.mean(test_cov):.3f}")
+
+    # Summary table
+    summary_rows = []
+    for s_name, s_idx in splits.items():
+        sub = case_df.iloc[s_idx]
+        row = {
+            "model": "peak_rl_v10", "split": s_name, "n_cases": len(sub),
+            "f1@5": sub["f1@5"].mean(), "f1@10": sub["f1@10"].mean(),
+            "f1@15": sub["f1@15"].mean(), "f1@20": sub["f1@20"].mean(),
+            "cwmae@10": sub["cwmae@10"].mean(), "coverage@10": sub["coverage@10"].mean(),
+            "point_rmse": sub["point_rmse"].mean(),
+            "avg_pred_kept": sub["n_pred_kept"].mean(),
+            "avg_pred_total": sub["n_pred_total"].mean(),
+        }
+        for col in ["conf_f1@10", "conf_coverage@10", "conf_cwmae@10", "conf_n_pred_kept"]:
+            if col in sub.columns:
+                row[col] = sub[col].mean()
+        summary_rows.append(row)
+
+    summary_df = pd.DataFrame(summary_rows)
+    summary_csv = out_dir / "dft_alignment_rl_summary.csv"
+    summary_df.to_csv(summary_csv, index=False)
+
+    test_row = summary_df[summary_df["split"] == "test"].iloc[0]
+    conf_f1 = test_row.get('conf_f1@10', float('nan'))
+    conf_cov = test_row.get('conf_coverage@10', float('nan'))
+    conf_kept = test_row.get('conf_n_pred_kept', float('nan'))
+    report = (
+        f"### DFT Alignment RL Results (test set)\n"
+        f"- Unfiltered: F1@10={test_row['f1@10']:.3f}  Coverage@10={test_row['coverage@10']:.3f}\n"
+        f"- Conf-filtered: F1@10={conf_f1:.3f}  Coverage@10={conf_cov:.3f}  "
+        f"({conf_kept:.0f} modes kept, threshold={rl_cfg.confidence_threshold})\n"
+        f"- Top-k filtered: F1@10={np.mean(test_f1s):.3f}  (k={best_k})\n"
+        f"- Point RMSE (matched@10): {test_row['point_rmse']:.2f} cm⁻¹"
+    )
+    print(report)
+
+    return {
+        "domains": {
+            "dft": {"best_model": "peak_rl_v10", "summary_csv": str(summary_csv),
+                    "case_csv": str(case_csv), "report_markdown": report},
+            "experimental": {"best_model": "uncorrected",
+                             "report_markdown": "Experimental study results pending."}
+        },
+        "checkpoint": str(rl_ckpt_path),
+    }
+
 
 def modal_notebook_guidance(v="/mnt/raman"):
     return f"Projected runtime high. Use `ALIGNMENT_USE_MODAL_VOLUME=1` at {v}"

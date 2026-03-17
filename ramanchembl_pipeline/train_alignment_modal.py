@@ -175,6 +175,96 @@ def train_alignment(
             device=device,
             train_config=cfg,
         )
+    elif model_type == "peak_v10_rl":
+        # -------------------------------------------------------------------
+        # v10 RL: REINFORCE fine-tune with F1@10 reward
+        # Requires a pre-trained checkpoint at /data/outputs/alignment_model.pth
+        # -------------------------------------------------------------------
+        rl_cfg = lib.AlignmentRLConfig(
+            max_epochs=max_epochs,
+            batch_size=128,
+            lr=1e-5,
+            K=16,
+            sigma_init=3.0,
+            patience=30,
+            freeze_encoder=False,       # need full 814K params for RL signal
+            conf_loss_weight=0.0,
+            confidence_threshold=0.5,
+            match_cutoff=15.0,
+            mode_feature_dim=12,
+            reward_tol=10.0,
+            top_k_filter=70,
+        )
+        print("RL Config:", rl_cfg)
+
+        ckpt_path = out_dir / "alignment_model.pth"
+        if not ckpt_path.exists():
+            print("No pre-trained checkpoint found — running Phase 1 (Sinkhorn) first...")
+            phase1_cfg = lib.AlignmentTrainConfig(
+                max_epochs=200, batch_size=256, patience=40,
+                latent_dim=latent_dim, transformer_layers=transformer_layers,
+                transformer_heads=transformer_heads,
+                coverage_loss_weight=coverage_loss_weight,
+                coverage_target_cm=10.0, lr=3e-4, weight_decay=1e-3,
+                string_feature_dim=128, match_cutoff=15.0,
+                confidence_loss_weight=1.0, confidence_threshold=0.5,
+                freq_loss_weight=1.0, repulsion_loss_weight=0.0,
+                use_sinkhorn=True, sinkhorn_tau=10.0, sinkhorn_match_sigma=10.0,
+                mode_feature_dim=12,
+            )
+            lib.run_alignment_study(
+                experimental_dataset=None, dft_dataset=dataset,
+                out_dir=out_dir, device=device, train_config=phase1_cfg,
+            )
+            print("Phase 1 done. Starting Phase 2 (REINFORCE)...")
+
+        results = lib.run_rl_finetune(
+            dft_dataset=dataset,
+            out_dir=out_dir,
+            device=device,
+            rl_config=rl_cfg,
+            checkpoint_path=str(ckpt_path),
+        )
+
+    elif model_type == "peak_v11":
+        # -------------------------------------------------------------------
+        # v11: Differentiable soft-F1 loss (direct metric optimization)
+        # -------------------------------------------------------------------
+        cfg = lib.AlignmentTrainConfig(
+            max_epochs=max_epochs,
+            batch_size=256,
+            patience=40,
+            latent_dim=latent_dim,
+            transformer_layers=transformer_layers,
+            transformer_heads=transformer_heads,
+            coverage_loss_weight=coverage_loss_weight,
+            coverage_target_cm=10.0,
+            lr=3e-4,
+            weight_decay=1e-3,
+            string_feature_dim=128,
+            match_cutoff=15.0,
+            confidence_loss_weight=1.0,
+            confidence_threshold=0.5,
+            freq_loss_weight=1.0,
+            repulsion_loss_weight=0.0,
+            repulsion_radius_cm=5.0,
+            mode_feature_dim=12,
+            use_soft_f1=True,           # differentiable F1
+            soft_f1_tol=10.0,           # match at 10 cm⁻¹ (same as eval)
+            soft_f1_tau=3.0,            # start warm
+            soft_f1_tau_min=0.5,        # anneal to sharp
+            sinkhorn_tau=10.0,          # soft assignment temperature
+        )
+        print("Config:", cfg)
+
+        results = lib.run_alignment_study(
+            experimental_dataset=None,
+            dft_dataset=dataset,
+            out_dir=out_dir,
+            device=device,
+            train_config=cfg,
+        )
+
     elif model_type == "peak_v10":
         # -------------------------------------------------------------------
         # v10: Peak transformer + eigenvector features + Sinkhorn OT loss
