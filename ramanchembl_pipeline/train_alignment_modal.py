@@ -107,7 +107,7 @@ app = modal.App("raman-alignment", image=image)
 @app.function(
     gpu="H200",
     volumes={"/data": vol},
-    timeout=10800,  # 3 hrs — v12 two-phase training needs more time
+    timeout=21600,  # 6 hrs — v13 Sinkhorn iterations are slower per epoch
     memory=32768,   # 32 GB RAM — dataset arrays for 10K molecules are ~4 GB
 )
 def train_alignment(
