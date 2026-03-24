@@ -1,0 +1,10 @@
+Metric,Mol2Raman (in-dist QM9),SpectraLoRA+ES (OOD RamanChemBL),SpectraLoRA Raw,Ratio (ours/M2R)
+Fingerprint F1@10,0.551,0.418,0.321,76%
+Fingerprint F1@15,0.631,0.532,0.426,84%
+Fingerprint F1@20,0.705,0.598,0.489,85%
+Fingerprint Recall@15,0.634,0.703,0.438,111%
+Fingerprint Precision@15,0.629,0.44,0.444,70%
+Full F1@10,—,0.371,0.276,—
+Full F1@15,—,0.472,0.366,—
+Full F1@20,—,0.532,0.42,—
+Cosine (full),0.689,0.486,0.216,70%
