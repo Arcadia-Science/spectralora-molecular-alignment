@@ -70,3 +70,7 @@ The manuscript is in `paper/paper.tex`, targeting TMLR. Compile with:
 ```bash
 cd paper && latexmk -pdf paper.tex
 ```
+
+## Acknowledgement
+
+We would like to thank Codex.
