@@ -48,7 +48,7 @@ python scripts/ingest/build_parquet.py --dataset qm9s --zip capsule-3259363/data
 docker-compose up --build
 ```
 
-### Run inference
+### Run local inference
 ```bash
 curl -X POST "http://localhost:8000/predict/raman" \
   -H "Content-Type: application/json" \
