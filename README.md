@@ -1,4 +1,4 @@
-# SpectraLoRA
+# SpectraLoRAFM
 
 Post-training compact molecular foundation models for surrogate Raman prediction and post-hoc spectral alignment via structural prompting and derivative-free optimization.
 
