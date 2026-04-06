@@ -6,7 +6,7 @@ Post-training compact molecular foundation models for surrogate Raman prediction
 
 SpectraLoRA adapts a 8M-parameter equivariant molecular foundation model (DetaNet) to predict Hessians, vibrational frequencies, and Raman spectra from 3D atomic coordinates. The model is pre-trained on ~22M molecules from SPICE, NABLA2DFT, QM9, and QM7, then adapted with SO(3)-equivariant LoRA (AdaLoRA for invariant layers, ELoRA for equivariant tensor-product layers). A two-phase post-hoc spectral alignment strategy, supervised pre-training of a 1D U-Net with structural prompting (FiLM conditioning on Morgan fingerprints), followed by Natural Evolution Strategies (NES) to hill-climb the non-differentiable F1 metric, pushes fingerprint F1@15 from 0.426 to 0.532 and peak recall to 0.703, exceeding the in-distribution recall of Mol2Raman (0.634) on a harder out-of-distribution benchmark.
 
-## Distributed System
+## Full Distributed System
 
 ![System Architecture](paper/figures/system.png)
 
