@@ -37,7 +37,7 @@ paper/                    Manuscript (LaTeX)
   figures/                Paper figures (PNG/PDF/SVG)
 ```
 
-## Quickstart
+## Local Setup
 
 ### Install
 ```bash
@@ -61,7 +61,7 @@ curl -X POST "http://localhost:8000/predict/raman" \
   -d '{"dataset":"qm9s","molecule_id":1}'
 ```
 
-## Hardware Requirements & Local Setup
+## Hardware Requirements
 - Minimal requirements: Laptop with 16GB of RAM + Docker for local inference on small dataset
 - Data Processing: AWS Batch or 3-5x c7a.48xlarge + EKS
 - Small Training: 7xp5e.48xlarge + AWS EKS Node group see : [AWS DOCS](https://docs.aws.amazon.com/eks/latest/userguide/machine-learning-on-eks.html)
