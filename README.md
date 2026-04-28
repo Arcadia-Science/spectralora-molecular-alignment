@@ -63,6 +63,7 @@ curl -X POST "http://localhost:8000/predict/raman" \
 
 ## Hardware Requirements & Local Setup
 - Minimal requirements: Laptop with 16GB of RAM + Docker for local inference on small dataset
+- Data Processing: AWS Batch or 3-5x c7a.48xlarge + EKS
 - Small Training: 7xp5e.48xlarge + AWS EKS Node group see : [AWS DOCS](https://docs.aws.amazon.com/eks/latest/userguide/machine-learning-on-eks.html)
 - Medium Training: 12-15x 5e.48xlarge + AWS EKS
 - Large Training: Hyperpod [AWS DOCS](https://aws.amazon.com/sagemaker/ai/hyperpod/)
