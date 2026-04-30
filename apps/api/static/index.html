@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SpectraLoRA — Raman Predictor</title>
+  <script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
+  <script src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #0d1117;
+      color: #c9d1d9;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 14px;
+      min-height: 100vh;
+    }
+    input, select, button { font-family: inherit; font-size: inherit; }
+    ::-webkit-scrollbar { width: 6px; } ::-webkit-scrollbar-track { background: #161b22; }
+    ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState } = React;
+    const {
+      LineChart, Line, XAxis, YAxis, CartesianGrid,
+      Tooltip, Legend, ResponsiveContainer, ReferenceLine,
+    } = Recharts;
+
+    const CARD = {
+      background: '#161b22',
+      border: '1px solid #30363d',
+      borderRadius: 8,
+      padding: '1.25rem',
+    };
+
+    const INPUT_STYLE = {
+      padding: '0.5rem 0.75rem',
+      background: '#0d1117',
+      border: '1px solid #30363d',
+      borderRadius: 6,
+      color: '#c9d1d9',
+      outline: 'none',
+      fontFamily: 'monospace',
+      fontSize: '0.9rem',
+      width: '100%',
+    };
+
+    function Chip({ label, value }) {
+      return (
+        <div style={{ minWidth: 80 }}>
+          <div style={{ color: '#8b949e', fontSize: '0.75rem', marginBottom: 2 }}>{label}</div>
+          <div style={{ fontFamily: 'monospace', fontSize: '0.85rem', color: '#c9d1d9' }}>{value}</div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [mode, setMode]       = useState('smiles');
+      const [smiles, setSmiles]   = useState('c1ccccc1');
+      const [dataset, setDataset] = useState('qm9s');
+      const [molId, setMolId]     = useState('1');
+      const [loading, setLoading] = useState(false);
+      const [result, setResult]   = useState(null);
+      const [error, setError]     = useState(null);
+      const [showRaw, setShowRaw] = useState(false);
+
+      const predict = async () => {
+        setLoading(true);
+        setError(null);
+        try {
+          const body = mode === 'smiles'
+            ? { smiles }
+            : { dataset, molecule_id: parseInt(molId, 10) };
+
+          const r = await fetch('/predict/raman', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+          });
+
+          if (!r.ok) {
+            const e = await r.json().catch(() => ({ detail: r.statusText }));
+            throw new Error(e.detail || r.statusText);
+          }
+          setResult(await r.json());
+        } catch (e) {
+          setError(e.message);
+        } finally {
+          setLoading(false);
+        }
+      };
+
+      // Downsample 3501 pts → ~700 for smooth rendering
+      const chartData = result
+        ? result.x_grid
+            .filter((_, i) => i % 5 === 0)
+            .map((x, si) => ({
+              x: Math.round(x),
+              Refined: parseFloat(result.spectrum_refined[si * 5].toFixed(4)),
+              Raw:     parseFloat(result.spectrum_raw[si * 5].toFixed(4)),
+            }))
+        : [];
+
+      const topPeaks = result
+        ? result.peaks.positions_cm
+            .map((p, i) => ({ pos: p, int: result.peaks.intensities[i] }))
+            .slice(0, 10)
+        : [];
+
+      return (
+        <div style={{ maxWidth: 1100, margin: '0 auto', padding: '2rem 1.5rem' }}>
+
+          {/* Header */}
+          <div style={{ marginBottom: '1.5rem' }}>
+            <h1 style={{ fontSize: '1.4rem', fontWeight: 700, color: '#58a6ff' }}>
+              SpectraLoRA
+            </h1>
+            <p style={{ color: '#8b949e', marginTop: 4, fontSize: '0.85rem' }}>
+              Raman spectrum prediction · Hi / Hij / depolar DetaNet + RefNet refinement
+            </p>
+          </div>
+
+          {/* Input card */}
+          <div style={{ ...CARD, marginBottom: '1.25rem' }}>
+
+            {/* Mode tabs */}
+            <div style={{ display: 'flex', gap: 6, marginBottom: '1rem' }}>
+              {[['smiles', 'SMILES'], ['db', 'Dataset + molecule ID']].map(([m, label]) => (
+                <button key={m} onClick={() => setMode(m)} style={{
+                  padding: '0.35rem 0.9rem',
+                  borderRadius: 6,
+                  border: '1px solid',
+                  borderColor: mode === m ? '#1f6feb' : '#30363d',
+                  background: mode === m ? '#1f6feb22' : 'transparent',
+                  color: mode === m ? '#58a6ff' : '#8b949e',
+                  cursor: 'pointer',
+                  fontWeight: mode === m ? 600 : 400,
+                  fontSize: '0.85rem',
+                }}>
+                  {label}
+                </button>
+              ))}
+            </div>
+
+            {/* Inputs */}
+            {mode === 'smiles' ? (
+              <input
+                style={INPUT_STYLE}
+                value={smiles}
+                onChange={e => setSmiles(e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && predict()}
+                placeholder="SMILES string — e.g. c1ccccc1"
+              />
+            ) : (
+              <div style={{ display: 'flex', gap: '0.75rem' }}>
+                <select
+                  value={dataset}
+                  onChange={e => setDataset(e.target.value)}
+                  style={{ ...INPUT_STYLE, width: 160 }}
+                >
+                  <option value="qm9s">qm9s</option>
+                  <option value="ext_val">ext_val</option>
+                  <option value="ext_val_env">ext_val_env</option>
+                </select>
+                <input
+                  style={{ ...INPUT_STYLE, width: 160 }}
+                  value={molId}
+                  onChange={e => setMolId(e.target.value)}
+                  onKeyDown={e => e.key === 'Enter' && predict()}
+                  placeholder="molecule_id"
+                />
+              </div>
+            )}
+
+            <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', marginTop: '0.9rem' }}>
+              <button
+                onClick={predict}
+                disabled={loading}
+                style={{
+                  padding: '0.5rem 1.4rem',
+                  background: loading ? '#21262d' : '#1f6feb',
+                  color: loading ? '#8b949e' : '#fff',
+                  border: 'none',
+                  borderRadius: 6,
+                  fontWeight: 600,
+                  cursor: loading ? 'not-allowed' : 'pointer',
+                  fontSize: '0.9rem',
+                  transition: 'background 0.15s',
+                }}
+              >
+                {loading ? '⏳ Running inference…' : 'Predict'}
+              </button>
+
+              {result && (
+                <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', color: '#8b949e', cursor: 'pointer', userSelect: 'none' }}>
+                  <input
+                    type="checkbox"
+                    checked={showRaw}
+                    onChange={e => setShowRaw(e.target.checked)}
+                    style={{ accentColor: '#3fb950' }}
+                  />
+                  <span style={{ fontSize: '0.85rem' }}>Overlay raw spectrum</span>
+                </label>
+              )}
+            </div>
+          </div>
+
+          {/* Error */}
+          {error && (
+            <div style={{
+              ...CARD,
+              borderColor: '#f8514966',
+              background: '#3d0c0c22',
+              color: '#f85149',
+              marginBottom: '1.25rem',
+              fontSize: '0.85rem',
+            }}>
+              ⚠ {error}
+            </div>
+          )}
+
+          {/* Results */}
+          {result && (
+            <>
+              {/* Metadata strip */}
+              <div style={{
+                display: 'flex', flexWrap: 'wrap', gap: '1.5rem',
+                marginBottom: '1rem', padding: '0.75rem 1rem',
+                background: '#161b22', border: '1px solid #30363d', borderRadius: 8,
+              }}>
+                <Chip label="SMILES" value={result.smiles.length > 40 ? result.smiles.slice(0, 40) + '…' : result.smiles} />
+                <Chip label="Atoms" value={result.n_atoms} />
+                <Chip label="Modes" value={result.n_modes} />
+                <Chip label="Total" value={`${result.timing.total_s}s`} />
+                <Chip label="GNN" value={`${result.timing.gnn_s}s`} />
+                <Chip label="Broaden" value={`${result.timing.broaden_s}s`} />
+                <Chip label="RefNet" value={`${result.timing.refine_s}s`} />
+              </div>
+
+              {/* Spectrum chart */}
+              <div style={{ ...CARD, marginBottom: '1rem' }}>
+                <div style={{ color: '#8b949e', fontSize: '0.75rem', marginBottom: '0.75rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                  Raman Spectrum · 500 – 4000 cm⁻¹
+                </div>
+                <ResponsiveContainer width="100%" height={300}>
+                  <LineChart data={chartData} margin={{ top: 4, right: 8, left: -16, bottom: 20 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#21262d" />
+                    <XAxis
+                      dataKey="x"
+                      type="number"
+                      domain={[500, 4000]}
+                      tickCount={8}
+                      tick={{ fill: '#8b949e', fontSize: 11 }}
+                      label={{ value: 'Wavenumber (cm⁻¹)', position: 'insideBottom', offset: -12, fill: '#8b949e', fontSize: 11 }}
+                    />
+                    <YAxis
+                      domain={[0, 1]}
+                      tickCount={5}
+                      tick={{ fill: '#8b949e', fontSize: 11 }}
+                      label={{ value: 'Intensity (norm.)', angle: -90, position: 'insideLeft', offset: 20, fill: '#8b949e', fontSize: 11 }}
+                    />
+                    <Tooltip
+                      contentStyle={{ background: '#161b22', border: '1px solid #30363d', borderRadius: 6, fontSize: 12 }}
+                      labelStyle={{ color: '#8b949e' }}
+                      formatter={(v, n) => [v.toFixed(3), n]}
+                      labelFormatter={v => `${v} cm⁻¹`}
+                    />
+                    <Legend wrapperStyle={{ fontSize: 12, color: '#8b949e', paddingTop: 8 }} />
+
+                    {/* Top 8 peak markers */}
+                    {topPeaks.map((pk, i) => (
+                      <ReferenceLine
+                        key={i}
+                        x={Math.round(pk.pos)}
+                        stroke="#f0883e44"
+                        strokeWidth={1}
+                        strokeDasharray="2 4"
+                      />
+                    ))}
+
+                    {showRaw && (
+                      <Line
+                        type="monotone" dataKey="Raw"
+                        stroke="#3fb950" dot={false} strokeWidth={1}
+                        strokeDasharray="4 3" strokeOpacity={0.7}
+                      />
+                    )}
+                    <Line
+                      type="monotone" dataKey="Refined"
+                      stroke="#58a6ff" dot={false} strokeWidth={1.5}
+                    />
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+
+              {/* Peaks */}
+              <div style={{ ...CARD }}>
+                <div style={{ color: '#8b949e', fontSize: '0.75rem', marginBottom: '0.6rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                  Top peaks (refined) — orange markers on chart
+                </div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.4rem' }}>
+                  {topPeaks.map((pk, i) => (
+                    <span key={i} style={{
+                      background: '#21262d',
+                      border: '1px solid #30363d',
+                      borderRadius: 5,
+                      padding: '0.2rem 0.6rem',
+                      fontFamily: 'monospace',
+                      fontSize: '0.82rem',
+                    }}>
+                      {Math.round(pk.pos)}{' '}
+                      <span style={{ color: '#8b949e' }}>({(pk.int * 100).toFixed(0)}%)</span>
+                    </span>
+                  ))}
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
