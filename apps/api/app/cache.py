@@ -1,32 +1,45 @@
+import hashlib
 import json
 
-import redis.asyncio as redis
+from redis.asyncio.cluster import ClusterNode, RedisCluster
 
-from app.config import settings
-
-_client: redis.Redis | None = None
+_client: RedisCluster | None = None
 
 
-async def init_cache() -> None:
+def _parse_nodes(nodes_str: str) -> list[ClusterNode]:
+    nodes = []
+    for part in nodes_str.split(","):
+        host, port = part.strip().split(":")
+        nodes.append(ClusterNode(host, int(port)))
+    return nodes
+
+
+async def init_cache(cluster_nodes_str: str) -> None:
     global _client
-    _client = redis.from_url(settings.redis_url, decode_responses=True)
+    _client = RedisCluster(
+        startup_nodes=_parse_nodes(cluster_nodes_str),
+        decode_responses=True,
+    )
 
 
 async def close_cache() -> None:
     if _client is not None:
-        await _client.close()
+        await _client.aclose()
 
 
 async def get_json(key: str):
     if _client is None:
         return None
     raw = await _client.get(key)
-    if raw is None:
-        return None
-    return json.loads(raw)
+    return json.loads(raw) if raw is not None else None
 
 
 async def set_json(key: str, value, ttl_seconds: int) -> None:
     if _client is None:
         return
-    await _client.set(key, json.dumps(value), ex=ttl_seconds)
+    await _client.setex(key, ttl_seconds, json.dumps(value))
+
+
+def smiles_key(smiles: str) -> str:
+    digest = hashlib.sha256(smiles.encode()).hexdigest()
+    return f"pred:raman:smiles:{digest}"
