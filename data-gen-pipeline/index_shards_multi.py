@@ -10,7 +10,7 @@ from typing import Iterable
 import torch
 
 
-RANK_DIR_RE = re.compile(r"^rank_\\d+$")
+RANK_DIR_RE = re.compile(r"^rank_\d+$")
 
 
 def init_db(conn: sqlite3.Connection) -> None:
