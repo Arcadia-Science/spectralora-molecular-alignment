@@ -78,9 +78,9 @@ curl -X POST "http://localhost:8000/predict/raman" \
 | FP Precision@15 | 0.444 | 0.440 | 0.629 |
 | Cosine (full) | 0.216 | 0.486 | 0.689 |
 
-## Demonstration
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/11CG3OZeLTPkKlNrVtZSm1U8AFh3XCC2g?usp=sharing)
-
+## Reproducibility: Demonstration of Prediction & Figures
+- To run the prediction system: [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/11CG3OZeLTPkKlNrVtZSm1U8AFh3XCC2g?usp=sharing)
+- To reproduce figures please run the cells in the [Figures Notebook](https://github.com/Arcadia-Science/2026-hp-peptides-ml/blob/main/figures/publication_figures.ipynb) note that you may need git-lfs to get all artifact csv files.
 
 
 ## Results Figure
