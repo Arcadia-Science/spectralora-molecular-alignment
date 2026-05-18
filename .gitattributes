@@ -7,3 +7,4 @@
 *.model filter=lfs diff=lfs merge=lfs -text
 *.db filter=lfs diff=lfs merge=lfs -text
 data-gen-pipeline/chembl-db/peptide_subset.db filter=lfs diff=lfs merge=lfs -text
+figures/artifacts/stats_line_level_matches.csv filter=lfs diff=lfs merge=lfs -text
