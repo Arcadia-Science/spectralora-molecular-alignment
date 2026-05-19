@@ -7,17 +7,21 @@ Post-training compact molecular GNNs for surrogate Raman prediction and post-hoc
 
 SpectraLoRA adapts a 8M-parameter equivariant molecular GNN model (DetaNet) to predict Hessians, vibrational frequencies, and Raman spectra from 3D atomic coordinates. The model is pre-trained on ~22M molecules from SPICE, NABLA2DFT, QM9, and QM7, then adapted with SO(3)-equivariant LoRA (AdaLoRA for invariant layers, ELoRA for equivariant tensor-product layers). A two-phase post-hoc spectral alignment strategy, supervised pre-training of a 1D U-Net with structural prompting (FiLM conditioning on Morgan fingerprints), followed by Natural Evolution Strategies (NES) to hill-climb the non-differentiable F1 metric, pushes fingerprint F1@15 from 0.426 to 0.532 and peak recall to 0.703, exceeding the in-distribution recall of Mol2Raman (0.634) on a harder out-of-distribution benchmark.
 
+<p align="center">
+<img width="624" height="346" alt="Screenshot 2026-04-28 at 2 50 33 PM" src="https://github.com/user-attachments/assets/c13db536-d091-4901-a853-1d4e2a731e7b" />
+</p>
+
+## Reproducibility: Demonstration of Prediction & Figures
+- To run the prediction system: [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/11CG3OZeLTPkKlNrVtZSm1U8AFh3XCC2g?usp=sharing)
+- To reproduce figures please run the cells in the [Figures Notebook](https://github.com/Arcadia-Science/2026-hp-peptides-ml/blob/main/figures/publication_figures.ipynb) note that you may need git-lfs to get all artifact csv files.
+
+
 ## Full Distributed System
 
 ![System Architecture](figures/system.png)
 
 The pipeline is deployed as a four-plane distributed architecture. An Amazon FSx for Lustre parallel file system serves as the shared storage backbone. Ray orchestrates both the offline data-engineering phase (CPU workers featurize heterogeneous molecular sources into sharded PyTorch Geometric graphs using lock-free, shared-nothing SQLite3 indexing) and the distributed training phase (DDP/FSDP jobs with NCCL-based gradient synchronization). Data loading streams pre-sharded, pre-randomized chunks assigned deterministically by GPU rank, trading perfect global shuffle for sustained sequential I/O. Online serving splits into a public FastAPI service (dataset browsing, inference orchestration, Postgres metadata, Redis caching) and a dedicated DetaNet model service with geometries stored in Parquet shards for random access.
 
-## Conceptual Figure
-
-<p align="center">
-<img width="624" height="346" alt="Screenshot 2026-04-28 at 2 50 33 PM" src="https://github.com/user-attachments/assets/c13db536-d091-4901-a853-1d4e2a731e7b" />
-</p>
 
 ## Repository Layout
 
@@ -94,13 +98,10 @@ curl -X POST "http://localhost:8000/predict/raman" \
 | FP Precision@15 | 0.444 | 0.440 | 0.629 |
 | Cosine (full) | 0.216 | 0.486 | 0.689 |
 
-## Reproducibility: Demonstration of Prediction & Figures
-- To run the prediction system: [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/11CG3OZeLTPkKlNrVtZSm1U8AFh3XCC2g?usp=sharing)
-- To reproduce figures please run the cells in the [Figures Notebook](https://github.com/Arcadia-Science/2026-hp-peptides-ml/blob/main/figures/publication_figures.ipynb) note that you may need git-lfs to get all artifact csv files.
-
 
 ## Results Figure
 <p align="center">
 <img width="634" height="243" alt="Screenshot 2026-04-28 at 2 52 01 PM" src="https://github.com/user-attachments/assets/cf164aa6-0124-4f47-9584-ef90409951c1" />
+<img width="626" height="404" alt="Screenshot 2026-05-19 at 9 37 38 AM" src="https://github.com/user-attachments/assets/330f265c-6a75-42d8-8f86-200a0d979c57" />
 </p>
 
