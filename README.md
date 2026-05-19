@@ -15,13 +15,11 @@ SpectraLoRA adapts a 8M-parameter equivariant molecular GNN model (DetaNet) to p
 - To run the prediction system: [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/11CG3OZeLTPkKlNrVtZSm1U8AFh3XCC2g?usp=sharing)
 - To reproduce figures please run the cells in the [Figures Notebook](https://github.com/Arcadia-Science/2026-hp-peptides-ml/blob/main/figures/publication_figures.ipynb) note that you may need git-lfs to get all artifact csv files.
 
-
-## Full Distributed System
-
-![System Architecture](figures/system.png)
-
-The pipeline is deployed as a four-plane distributed architecture. An Amazon FSx for Lustre parallel file system serves as the shared storage backbone. Ray orchestrates both the offline data-engineering phase (CPU workers featurize heterogeneous molecular sources into sharded PyTorch Geometric graphs using lock-free, shared-nothing SQLite3 indexing) and the distributed training phase (DDP/FSDP jobs with NCCL-based gradient synchronization). Data loading streams pre-sharded, pre-randomized chunks assigned deterministically by GPU rank, trading perfect global shuffle for sustained sequential I/O. Online serving splits into a public FastAPI service (dataset browsing, inference orchestration, Postgres metadata, Redis caching) and a dedicated DetaNet model service with geometries stored in Parquet shards for random access.
-
+## Results Figure
+<p align="center">
+<img width="626" height="404" alt="Screenshot 2026-05-19 at 9 37 38 AM" src="https://github.com/user-attachments/assets/330f265c-6a75-42d8-8f86-200a0d979c57" />
+<img width="634" height="243" alt="Screenshot 2026-04-28 at 2 52 01 PM" src="https://github.com/user-attachments/assets/cf164aa6-0124-4f47-9584-ef90409951c1" />
+</p>
 
 ## Repository Layout
 
@@ -99,9 +97,8 @@ curl -X POST "http://localhost:8000/predict/raman" \
 | Cosine (full) | 0.216 | 0.486 | 0.689 |
 
 
-## Results Figure
-<p align="center">
-<img width="634" height="243" alt="Screenshot 2026-04-28 at 2 52 01 PM" src="https://github.com/user-attachments/assets/cf164aa6-0124-4f47-9584-ef90409951c1" />
-<img width="626" height="404" alt="Screenshot 2026-05-19 at 9 37 38 AM" src="https://github.com/user-attachments/assets/330f265c-6a75-42d8-8f86-200a0d979c57" />
-</p>
+## Full Distributed System
 
+![System Architecture](figures/system.png)
+
+The pipeline is deployed as a four-plane distributed architecture. An Amazon FSx for Lustre parallel file system serves as the shared storage backbone. Ray orchestrates both the offline data-engineering phase (CPU workers featurize heterogeneous molecular sources into sharded PyTorch Geometric graphs using lock-free, shared-nothing SQLite3 indexing) and the distributed training phase (DDP/FSDP jobs with NCCL-based gradient synchronization). Data loading streams pre-sharded, pre-randomized chunks assigned deterministically by GPU rank, trading perfect global shuffle for sustained sequential I/O. Online serving splits into a public FastAPI service (dataset browsing, inference orchestration, Postgres metadata, Redis caching) and a dedicated DetaNet model service with geometries stored in Parquet shards for random access.
