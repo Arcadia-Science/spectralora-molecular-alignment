@@ -46,12 +46,12 @@ This repo uses Git LFS for large model checkpoints and data files.
 **Full clone (requires [git-lfs](https://git-lfs.com)):**
 ```bash
 git lfs install
-git clone https://github.com/Arcadia-Science/2026-hp-peptides-ml
+https://github.com/Arcadia-Science/spectralora-molecular-alignment
 ```
 
 **Code-only clone (skip LFS binaries, ~50 MB):**
 ```bash
-GIT_LFS_SKIP_SMUDGE=1 git clone https://github.com/Arcadia-Science/2026-hp-peptides-ml
+GIT_LFS_SKIP_SMUDGE=1 git clone https://github.com/Arcadia-Science/spectralora-molecular-alignment
 ```
 LFS pointer stubs are checked out in place of the actual files. Model weights for inference are available separately on HuggingFace.
 
