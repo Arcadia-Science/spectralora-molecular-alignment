@@ -83,7 +83,7 @@ packaging==25.0
 pandocfilters==1.5.1
 parso==0.8.5
 pexpect==4.9.0
-pillow==12.1.0
+pillow==13.0.0
 platformdirs==4.5.1
 pluggy==1.6.0
 prometheus_client==0.23.1
