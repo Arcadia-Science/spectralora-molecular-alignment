@@ -30,7 +30,7 @@ e3nn==0.5.9
 executing==2.2.1
 fastapi==0.128.0
 fastjsonschema==2.21.2
-filelock==3.20.3
+filelock==4.2.1
 fonttools==4.61.1
 fqdn==1.5.1
 frozenlist==1.8.0
