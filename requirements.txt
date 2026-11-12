@@ -123,7 +123,7 @@ starlette==0.50.0
 sympy==1.14.0
 terminado==0.18.1
 tinycss2==1.4.0
-torch==2.8.0
+torch==2.13.0
 torch-geometric==2.7.0
 torch_cluster==1.6.3; platform_system == "Darwin"
 torch_cluster==1.6.3+pt28cpu; platform_system == "Linux"
